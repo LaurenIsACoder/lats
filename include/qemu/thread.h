@@ -47,6 +47,7 @@ typedef void (*QemuCondWaitFunc)(QemuCond *c, QemuMutex *m, const char *f,
 typedef bool (*QemuCondTimedWaitFunc)(QemuCond *c, QemuMutex *m, int ms,
                                       const char *f, int l);
 
+void qemu_bql_lock_impl(QemuMutex *mutex, const char *file, int line);
 extern QemuMutexLockFunc qemu_bql_mutex_lock_func;
 extern QemuMutexLockFunc qemu_mutex_lock_func;
 extern QemuMutexTrylockFunc qemu_mutex_trylock_func;
@@ -403,5 +404,36 @@ void qemu_lockcnt_inc_and_unlock(QemuLockCnt *lockcnt);
  * is non-zero.
  */
 unsigned qemu_lockcnt_count(QemuLockCnt *lockcnt);
+
+void qemu_spin_lock_impl(QemuMutex *mutex, const char *file, const int line);
+
+#ifdef CONFIG_LATX_OPT_BQL
+void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex);
+bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, QemuMutex *mutex, int n, bool inc);
+void qemu_cond_broadcast_1(QemuCond *cond);
+void qemu_cond_signal_1(QemuCond *cond);
+void qemu_mutex_lock_1(QemuMutex *mutex);
+void qemu_mutex_unlock_1(QemuMutex *mutex);
+void qemu_cond_wait_2(QemuCond *cond, QemuMutex *mutex);
+void qemu_cond_broadcast_2(QemuCond *cond);
+void qemu_cond_signal_2(QemuCond *cond);
+void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n);
+void qemu_cond_broadcast_3(QemuCond *cond);
+void qemu_cond_signal_3(QemuCond *cond);
+#else
+
+#define qemu_mutex_lock_1(m) qemu_mutex_lock(m)
+#define qemu_mutex_unlock_1(m) qemu_mutex_unlock(m)
+#define qemu_cond_wait_1(c, m) qemu_cond_wait(c, m)
+#define qemu_cond_signal_1(c) qemu_cond_signal(c)
+#define qemu_cond_broadcast_1(c) qemu_cond_broadcast(c)
+#define qemu_cond_wait_2(c, m) qemu_cond_wait(c, m)
+#define qemu_cond_broadcast_2(c) qemu_cond_broadcast(c)
+#define qemu_cond_signal_2(c) qemu_cond_signal(c)
+#define qemu_cond_wait_3(c, m, a) qemu_cond_wait(c, m)
+#define qemu_cond_broadcast_3(c) qemu_cond_broadcast(c)
+#define qemu_cond_signal_3(c) qemu_cond_signal(c)
+
+#endif
 
 #endif

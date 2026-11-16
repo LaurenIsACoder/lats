@@ -34,6 +34,7 @@
 #include "hw/qdev-properties.h"
 #include "trace.h"
 #include "qemu/plugin.h"
+#include "target/i386/latx/include/latx-sigrt-sys.h"
 
 CPUState *cpu_by_arch_id(int64_t id)
 {
@@ -86,7 +87,7 @@ void cpu_exit(CPUState *cpu)
     qatomic_set(&cpu->exit_request, 1);
     /* Ensure cpu_exec will see the exit request after TCG has exited.  */
     smp_wmb();
-    qatomic_set(&cpu->icount_decr_ptr->u16.high, -1);
+    lats_request_tb_exit(cpu);
 }
 
 static int cpu_common_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg)

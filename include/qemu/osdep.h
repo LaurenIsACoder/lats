@@ -34,6 +34,8 @@
 #include "exec/poison.h"
 #endif
 
+#include "latx-opt-def.h"
+
 /*
  * HOST_WORDS_BIGENDIAN was replaced with HOST_BIG_ENDIAN. Prevent it from
  * creeping back in.
@@ -110,7 +112,12 @@ QEMU_EXTERN_C int daemon(int, int);
 #include <getopt.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifdef NDEBUG
+#undef assert
+#define assert(x) ((void)(x))
+#else
 #include <assert.h>
+#endif
 /* setjmp must be declared before sysemu/os-win32.h
  * because it is redefined there. */
 #include <setjmp.h>
@@ -273,9 +280,11 @@ void QEMU_ERROR("code path is reachable")
  * submit patches to remove any side-effects inside an assertion, or
  * fixing error handling that should use Error instead of assert.
  */
+/*
 #ifdef NDEBUG
 #error building with NDEBUG is not supported
 #endif
+*/
 #ifdef G_DISABLE_ASSERT
 #error building with G_DISABLE_ASSERT is not supported
 #endif
@@ -474,6 +483,8 @@ void QEMU_ERROR("code path is reachable")
 int qemu_daemon(int nochdir, int noclose);
 void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
                           bool noreserve);
+void *qemu_anon_ram_alloc_from_base(size_t size, void *base,
+        uint64_t *align, bool shared, bool noreserve);
 void qemu_anon_ram_free(void *ptr, size_t size);
 
 #ifdef _WIN32

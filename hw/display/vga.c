@@ -2172,6 +2172,7 @@ static inline uint32_t uint_clamp(uint32_t val, uint32_t vmin, uint32_t vmax)
     return val;
 }
 
+VGACommonState *system_vga;
 bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
 {
     int i, j, v, b;
@@ -2198,6 +2199,10 @@ bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
             v |= b << (2 * j + 1);
         }
         expand4to8[i] = v;
+    }
+
+    if(system_vga != s) {
+        system_vga = s;
     }
 
     s->vram_size_mb = uint_clamp(s->vram_size_mb, 1, 512);

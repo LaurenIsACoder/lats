@@ -19,12 +19,16 @@
 
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "exec/cpu_ldst.h"
 #include "exec/address-spaces.h"
 #include "exec/exec-all.h"
 #include "tcg/helper-tcg.h"
+#include "hamt-tlb.h"
+#include "latx/include/latx-options.h"
+#include "trace.h"
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
@@ -94,25 +98,69 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
             ((env->cr[0] ^ t0) & ~(CR0_TS_MASK | CR0_MP_MASK))) {
             cpu_vmexit(env, SVM_EXIT_CR0_SEL_WRITE, 0, GETPC());
         }
+        if ((env->cr[4] & CR4_PCIDE_MASK) && !(t0 & CR0_PG_MASK)) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
         cpu_x86_update_cr0(env, t0);
         break;
-    case 3:
+    case 3: {
+        int64_t start = option_pcid_stats ? get_clock() : 0;
+        bool noflush = (env->cr[4] & CR4_PCIDE_MASK) && (t0 & BIT_ULL(63));
+
+        /* Bit 63 of the source is a hint, never part of the stored CR3. */
+        if (env->cr[4] & CR4_PCIDE_MASK) {
+            t0 &= ~BIT_ULL(63);
+        }
         if ((env->efer & MSR_EFER_LMA) &&
                 (t0 & ((~0ULL) << env_archcpu(env)->phys_bits))) {
-            cpu_vmexit(env, SVM_EXIT_ERR, 0, GETPC());
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
         }
         if (!(env->efer & MSR_EFER_LMA)) {
             t0 &= 0xffffffffUL;
         }
-        cpu_x86_update_cr3(env, t0);
+        if (option_pcid_stats) {
+            unsigned pcid = t0 & 0xfff;
+
+            qatomic_inc(&env->pcid_stats.cr3_writes);
+            if (env->cr[4] & CR4_PCIDE_MASK) {
+                qatomic_inc(&env->pcid_stats.pcide_writes);
+                qatomic_or(&env->pcid_stats.seen[pcid >> 6],
+                           BIT_ULL(pcid & 63));
+            }
+            if (noflush) {
+                qatomic_inc(&env->pcid_stats.noflush);
+            }
+        }
+        trace_x86_pcid_cr3(env_cpu(env)->cpu_index, env->eip, env->cr[3], t0,
+                           noflush);
+        if (option_pcid_asid && (env->cr[4] & CR4_PCIDE_MASK) &&
+            hamt_is_running() && hamt_switch_pcid(env, t0, noflush)) {
+            env->cr[3] = t0;
+            tlb_flush_after_pcid_switch(env_cpu(env));
+        } else {
+            cpu_x86_update_cr3(env, t0);
+        }
+        if (option_pcid_stats) {
+            qatomic_add(&env->pcid_stats.cr3_ns, get_clock() - start);
+        }
         break;
+    }
     case 4:
-        if (t0 & cr4_reserved_bits(env)) {
-            cpu_vmexit(env, SVM_EXIT_ERR, 0, GETPC());
+        if ((t0 & cr4_reserved_bits(env)) ||
+            ((env->efer & MSR_EFER_LMA) && !(t0 & CR4_PAE_MASK)) ||
+            ((t0 & CR4_PCIDE_MASK) &&
+             (!(env->efer & MSR_EFER_LMA) ||
+              (!(env->cr[4] & CR4_PCIDE_MASK) && (env->cr[3] & 0xfff))))) {
+            raise_exception_ra(env, EXCP0D_GPF, GETPC());
         }
         if (((t0 ^ env->cr[4]) & CR4_LA57_MASK) &&
             (env->hflags & HF_CS64_MASK)) {
             raise_exception_ra(env, EXCP0D_GPF, GETPC());
+        }
+        if (option_pcid_stats && (t0 & CR4_PCIDE_MASK) &&
+            !(env->cr[4] & CR4_PCIDE_MASK)) {
+            qatomic_inc(&env->pcid_stats.enables);
+            qatomic_or(&env->pcid_stats.seen[0], 1);
         }
         cpu_x86_update_cr4(env, t0);
         break;
@@ -137,6 +185,104 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
     }
 }
 
+/* Legacy linear addresses wrap at 4 GiB, even inside an unaligned qword. */
+static uint64_t invpcid_ldq(CPUX86State *env, target_ulong addr, uintptr_t ra)
+{
+    if (!(env->hflags & HF_CS64_MASK)) {
+        addr = (uint32_t)addr;
+        if (unlikely(addr > UINT32_MAX - 7)) {
+            uint64_t value = 0;
+
+            for (unsigned i = 0; i < 8; i++) {
+                value |= (uint64_t)cpu_ldub_data_ra(env, (uint32_t)(addr + i),
+                                                    ra) << (8 * i);
+            }
+            return value;
+        }
+    }
+    return cpu_ldq_data_ra(env, addr, ra);
+}
+
+/*
+ * The descriptor is a memory operand even for the all-context variants.
+ * Complete both reads and all validation before changing any cached state.
+ */
+void helper_invpcid(CPUX86State *env, target_ulong addr, uint32_t reg,
+                    uint32_t seg)
+{
+    const uintptr_t ra = GETPC();
+    uint64_t type = (env->hflags & HF_CS64_MASK) ?
+                    env->regs[reg] : (uint32_t)env->regs[reg];
+    uint64_t pcid, linear;
+    int width = env->cr[4] & CR4_LA57_MASK ? 57 : 48;
+
+    if (!(env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_INVPCID) ||
+        (IS_AMD_CPU(env) &&
+         (!(env->cr[0] & CR0_PE_MASK) || (env->eflags & VM_MASK)))) {
+        raise_exception_ra(env, EXCP06_ILLOP, ra);
+    }
+    if (env->hflags & HF_CPL_MASK) {
+        raise_exception_ra(env, EXCP0D_GPF, ra);
+    }
+    if (unlikely(env->hflags & HF_GUEST_MASK)) {
+        CPUState *cs = env_cpu(env);
+        hwaddr vmcb = env->vm_vmcb;
+
+        /* The intercept precedes descriptor address and contents checks. */
+        if (x86_ldl_phys(cs, vmcb + offsetof(struct vmcb, control.intercept3))
+            & SVM_INTERCEPT_INVPCID) {
+            x86_stq_phys(cs, vmcb + offsetof(struct vmcb, control.exit_info_2),
+                         type);
+            cpu_vmexit(env, SVM_EXIT_INVPCID, addr, ra);
+        }
+    }
+    if (env->hflags & HF_CS64_MASK) {
+        uint64_t end = addr + 15;
+
+        if (end < addr || (uint64_t)sextract64(addr, 0, width) != addr ||
+            (uint64_t)sextract64(end, 0, width) != end) {
+            raise_exception_ra(env, seg == R_SS ? EXCP0C_STACK : EXCP0D_GPF,
+                               ra);
+        }
+    } else {
+        SegmentCache *sc = &env->segs[seg];
+        uint64_t offset = (uint32_t)(addr - sc->base);
+        uint64_t end = offset + 15;
+        bool invalid;
+
+        if (!(sc->flags & DESC_CS_MASK) && (sc->flags & DESC_E_MASK)) {
+            invalid = offset <= sc->limit ||
+                      end > ((sc->flags & DESC_B_MASK)
+                             ? UINT32_MAX : UINT16_MAX);
+        } else {
+            invalid = end > sc->limit;
+        }
+        if ((env->cr[0] & CR0_PE_MASK) &&
+            (!(sc->flags & DESC_P_MASK) ||
+             ((sc->flags & DESC_CS_MASK) && !(sc->flags & DESC_R_MASK)))) {
+            invalid = true;
+        }
+        if (invalid) {
+            raise_exception_ra(env, seg == R_SS ? EXCP0C_STACK : EXCP0D_GPF,
+                               ra);
+        }
+    }
+    pcid = invpcid_ldq(env, addr, ra);
+    linear = invpcid_ldq(env, addr + 8, ra);
+    if (type > 3 || (pcid >> 12) ||
+        (type <= 1 && !(env->cr[4] & CR4_PCIDE_MASK) && pcid) ||
+        (type == 0 && linear !=
+         (uint64_t)sextract64(linear, 0, cpu_x86_virtual_addr_width(env)))) {
+        raise_exception_ra(env, EXCP0D_GPF, ra);
+    }
+
+    if (option_pcid_stats) {
+        qatomic_inc(&env->pcid_stats.invpcid[type]);
+    }
+    /* Over-invalidation is permitted for all four architectural types. */
+    tlb_flush(env_cpu(env));
+}
+
 void helper_wrmsr(CPUX86State *env)
 {
     uint64_t val;
@@ -148,6 +294,9 @@ void helper_wrmsr(CPUX86State *env)
         ((uint64_t)((uint32_t)env->regs[R_EDX]) << 32);
 
     switch ((uint32_t)env->regs[R_ECX]) {
+    case MSR_IA32_TSC:
+        env->tsc_base_offset += val - cpu_get_tsc(env);
+        break;
     case MSR_IA32_SYSENTER_CS:
         env->sysenter_cs = val & 0xffff;
         break;
@@ -316,6 +465,9 @@ void helper_rdmsr(CPUX86State *env)
     cpu_svm_check_intercept_param(env, SVM_EXIT_MSR, 0, GETPC());
 
     switch ((uint32_t)env->regs[R_ECX]) {
+    case MSR_IA32_TSC:
+        val = cpu_get_tsc(env) + env->tsc_offset;
+        break;
     case MSR_IA32_SYSENTER_CS:
         val = env->sysenter_cs;
         break;

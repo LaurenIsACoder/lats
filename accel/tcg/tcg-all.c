@@ -37,6 +37,7 @@
 #include "qemu/units.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "hw/boards.h"
+#include "target/i386/latx/include/latx-options.h"
 #endif
 #include "internal.h"
 
@@ -47,6 +48,11 @@ struct TCGState {
     bool one_insn_per_tb;
     int splitwx_enabled;
     unsigned long tb_size;
+    int tcg_exec_mode;
+    bool mtcc_enabled;
+    int tcg_flush_mode;
+    bool fast_mmu_enabled;
+    int cc_n_regions;
 };
 typedef struct TCGState TCGState;
 
@@ -88,17 +94,43 @@ static void tcg_accel_instance_init(Object *obj)
     TCGState *s = TCG_STATE(obj);
 
     s->mttcg_enabled = default_mttcg_enabled();
+#if !defined(CONFIG_LATX_RR)
+    s->mttcg_enabled = true;
+#endif
 
     /* If debugging enabled, default "auto on", otherwise off. */
-#if defined(CONFIG_DEBUG_TCG) && !defined(CONFIG_USER_ONLY)
-    s->splitwx_enabled = -1;
-#else
     s->splitwx_enabled = 0;
+
+    s->tcg_exec_mode = 2; /* LAT */
+
+#if defined(CONFIG_LATX_TCG_MODE)
+    s->tcg_exec_mode = 1; /* TCG */
+    s->mtcc_enabled = false;
+#else
+#ifdef CONFIG_USER_ONLY
+    s->mtcc_enabled = false;
+#else
+    s->mtcc_enabled = true;
 #endif
+#endif
+
+    s->tcg_flush_mode = 1; /* Full Flush */
+
+    s->fast_mmu_enabled = 0;
+
+    s->cc_n_regions = 0;
 }
 
 bool mttcg_enabled;
+bool mtcc_enabled;
+bool fast_mmu_enabled;
 bool one_insn_per_tb;
+bool tcg_exec_mode_1_tcg;
+bool tcg_exec_mode_2_lat;
+bool tcg_exec_mode_3_mix;
+bool tcg_flush_mode_1_full;
+bool tcg_flush_mode_2_fifo;
+int tcg_cc_n_regions;
 
 static int tcg_init_machine(MachineState *ms)
 {
@@ -111,6 +143,57 @@ static int tcg_init_machine(MachineState *ms)
 
     tcg_allowed = true;
     mttcg_enabled = s->mttcg_enabled;
+#if !defined(CONFIG_LATX_RR)
+    mttcg_enabled = true;
+#endif
+
+#ifdef CONFIG_SOFTMMU
+    /* RR multiplexes guest CPUs in one HAMT hardware ASID namespace. */
+    if (option_pcid_asid && !mttcg_enabled) {
+        warn_report("pcidasid requires multi-threaded TCG; disabling "
+                    "pcidasid and pcidcache");
+        option_pcid_asid = 0;
+        option_pcid_cache = 0;
+    }
+#endif
+    fast_mmu_enabled = s->fast_mmu_enabled;
+
+    tcg_cc_n_regions = s->cc_n_regions;
+
+    tcg_exec_mode_1_tcg = false;
+    tcg_exec_mode_2_lat = false;
+    tcg_exec_mode_3_mix = false;
+
+    switch (s->tcg_exec_mode) {
+    case 1: tcg_exec_mode_1_tcg = true; break;
+    case 2: tcg_exec_mode_2_lat = true; break;
+    case 3: tcg_exec_mode_3_mix = true; break;
+    default:
+        assert(0);
+        break;
+    }
+
+    tcg_flush_mode_1_full = false;
+    tcg_flush_mode_2_fifo = false;
+
+    switch (s->tcg_flush_mode) {
+    case 1: tcg_flush_mode_1_full = true; break;
+    case 2: tcg_flush_mode_2_fifo = true; break;
+    default:
+        assert(0);
+        break;
+    }
+
+#if defined(CONFIG_LATX_TCG_MODE)
+    if (tcg_exec_mode_1_tcg) {
+        mtcc_enabled = false;
+    }
+#else
+    mtcc_enabled = s->mtcc_enabled;
+#if defined(CONFIG_SOFTMMU)
+    mtcc_enabled = true;
+#endif
+#endif
 
     page_init();
     tb_htable_init();
@@ -121,10 +204,80 @@ static int tcg_init_machine(MachineState *ms)
      * There's no guest base to take into account, so go ahead and
      * initialize the prologue now.
      */
-    tcg_prologue_init(tcg_ctx);
+    if (qemu_tcg_mtcc_enabled()) {
+        for (int i = 0; i < MTCC_NR; ++i) {
+#ifdef CONFIG_LATX_PRINT
+            printf("%s tcg_ctx_mtcc %d %p\n", __func__,
+                    i, tcg_ctx_mtcc[i]);
+#endif
+            tcg_prologue_init(tcg_ctx_mtcc[i]);
+        }
+    } else {
+        tcg_prologue_init(tcg_ctx);
+    }
 #endif
 
     return 0;
+}
+
+static char *tcg_get_mode(Object *obj, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    switch (s->tcg_exec_mode) {
+    case 1:
+        return g_strdup("tcg");
+    case 2:
+        return g_strdup("lat");
+    case 3:
+        return g_strdup("mix");
+    default:
+        error_setg(errp, "Invalid tcg exec mode %d", s->tcg_exec_mode);
+        return NULL;
+    }
+}
+
+static void tcg_set_mode(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "tcg") == 0) {
+        s->tcg_exec_mode = 1;
+    } else if (strcmp(value, "lat") == 0) {
+        s->tcg_exec_mode = 2;
+    } else if (strcmp(value, "mix") == 0) {
+        s->tcg_exec_mode = 3;
+    } else {
+        error_setg(errp, "Invalid 'mode' setting %s", value);
+    }
+}
+
+static char *tcg_get_flush(Object *obj, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    switch (s->tcg_flush_mode) {
+    case 1:
+        return g_strdup("flush");
+    case 2:
+        return g_strdup("fifo");
+    default:
+        error_setg(errp, "Invalid tcg flush mode %d", s->tcg_exec_mode);
+        return NULL;
+    }
+}
+
+static void tcg_set_flush(Object *obj, const char *value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+
+    if (strcmp(value, "full") == 0) {
+        s->tcg_flush_mode = 1;
+    } else if (strcmp(value, "fifo") == 0) {
+        s->tcg_flush_mode = 2;
+    } else {
+        error_setg(errp, "Invalid 'flush' setting %s", value);
+    }
 }
 
 static char *tcg_get_thread(Object *obj, Error **errp)
@@ -181,6 +334,57 @@ static void tcg_set_tb_size(Object *obj, Visitor *v,
     s->tb_size = value;
 }
 
+static void tcg_get_ccn(Object *obj, Visitor *v,
+                        const char *name, void *opaque,
+                        Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    uint32_t value = s->cc_n_regions;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void tcg_set_ccn(Object *obj, Visitor *v,
+                        const char *name, void *opaque,
+                        Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+
+    s->cc_n_regions = value;
+}
+
+static bool tcg_get_mtcc(Object *obj, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    return s->mtcc_enabled;
+}
+
+static void tcg_set_mtcc(Object *obj, bool value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    s->mtcc_enabled = value;
+#if defined(CONFIG_LATX_TCG_MODE)
+    s->mtcc_enabled = false;
+#endif
+}
+
+static bool tcg_get_fast_mmu(Object *obj, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    return s->fast_mmu_enabled;
+}
+
+static void tcg_set_fast_mmu(Object *obj, bool value, Error **errp)
+{
+    TCGState *s = TCG_STATE(obj);
+    s->fast_mmu_enabled = value;
+}
+
 static bool tcg_get_splitwx(Object *obj, Error **errp)
 {
     TCGState *s = TCG_STATE(obj);
@@ -234,11 +438,34 @@ static void tcg_accel_class_init(ObjectClass *oc, void *data)
                                   tcg_get_thread,
                                   tcg_set_thread);
 
+    object_class_property_add_str(oc, "mode",
+                                  tcg_get_mode,
+                                  tcg_set_mode);
+
+    object_class_property_add_str(oc, "flush",
+                                  tcg_get_flush,
+                                  tcg_set_flush);
+
+    object_class_property_add_bool(oc, "mtcc",
+        tcg_get_mtcc, tcg_set_mtcc);
+    object_class_property_set_description(oc, "mtcc",
+        "multi code cache");
+
+    object_class_property_add_bool(oc, "fastmmu",
+        tcg_get_fast_mmu, tcg_set_fast_mmu);
+    object_class_property_set_description(oc, "fastmmu",
+        "fast mmu transalte");
+
     object_class_property_add(oc, "tb-size", "int",
         tcg_get_tb_size, tcg_set_tb_size,
         NULL, NULL);
     object_class_property_set_description(oc, "tb-size",
         "TCG translation block cache size");
+
+    object_class_property_add(oc, "ccn", "int",
+        tcg_get_ccn, tcg_set_ccn, NULL, NULL);
+    object_class_property_set_description(oc, "ccn",
+        "code cache n regions");
 
     object_class_property_add_bool(oc, "split-wx",
         tcg_get_splitwx, tcg_set_splitwx);

@@ -166,4 +166,24 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(QemuLockable, qemu_lockable_auto_unlock)
     glue(qemu_lockable_auto, __COUNTER__) G_GNUC_UNUSED =        \
             qemu_lockable_auto_lock(QEMU_MAKE_LOCKABLE((x)))
 
+#ifdef CONFIG_LATX_OPT_BQL
+#define QML_OBJ_1(x, name) (&(QemuLockable) {                            \
+        .object = (x),                                                  \
+        .lock = (QemuLockUnlockFunc *) qemu_ ## name ## _lock_1,          \
+        .unlock = (QemuLockUnlockFunc *) qemu_ ## name ## _unlock_1       \
+    })
+
+#define QEMU_MAKE_LOCKABLE_1(x)                                           \
+    _Generic((x), QemuLockable *: (x),                                  \
+             void *: qemu_null_lockable(x),                             \
+             QemuMutex *: qemu_make_lockable(x, QML_OBJ_1(x, mutex)))
+
+#define QEMU_LOCK_GUARD_1(x)                                       \
+    g_autoptr(QemuLockable)                                      \
+    glue(qemu_lockable_auto, __COUNTER__) G_GNUC_UNUSED =        \
+            qemu_lockable_auto_lock(QEMU_MAKE_LOCKABLE_1((x)))
+#else
+#define QEMU_LOCK_GUARD_1(x) QEMU_LOCK_GUARD(x)
+#endif
+
 #endif

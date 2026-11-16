@@ -49,19 +49,22 @@ void x86_cpu_xsave_all_areas(X86CPU *cpu, void *buf, uint32_t buflen)
 
     header->xstate_bv = env->xstate_bv;
 
-    e = &x86_ext_save_areas[XSTATE_YMM_BIT];
-    if (e->size && e->offset) {
-        XSaveAVX *avx;
-
-        avx = buf + e->offset;
-
-        for (i = 0; i < CPU_NB_REGS; i++) {
-            uint8_t *ymmh = avx->ymmh[i];
-
-            stq_p(ymmh,     env->xmm_regs[i].ZMM_Q(2));
-            stq_p(ymmh + 8, env->xmm_regs[i].ZMM_Q(3));
-        }
-    }
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    e = &x86_ext_save_areas[XSTATE_YMM_BIT];
+//    if (e->size && e->offset) {
+//        XSaveAVX *avx;
+//
+//        avx = buf + e->offset;
+//
+//        for (i = 0; i < CPU_NB_REGS; i++) {
+//            uint8_t *ymmh = avx->ymmh[i];
+//
+//            stq_p(ymmh,     env->xmm_regs[i].ZMM_Q(2));
+//            stq_p(ymmh + 8, env->xmm_regs[i].ZMM_Q(3));
+//        }
+//    }
 
     e = &x86_ext_save_areas[XSTATE_BNDREGS_BIT];
     if (e->size && e->offset) {
@@ -80,44 +83,47 @@ void x86_cpu_xsave_all_areas(X86CPU *cpu, void *buf, uint32_t buflen)
         bndcsr->bndcsr = env->bndcs_regs;
     }
 
-    e = &x86_ext_save_areas[XSTATE_OPMASK_BIT];
-    if (e->size && e->offset) {
-        XSaveOpmask *opmask;
-        XSaveZMM_Hi256 *zmm_hi256;
-#ifdef TARGET_X86_64
-        XSaveHi16_ZMM *hi16_zmm;
-#endif
-
-        f = &x86_ext_save_areas[XSTATE_ZMM_Hi256_BIT];
-        assert(f->size);
-        assert(f->offset);
-
-        opmask = buf + e->offset;
-        zmm_hi256 = buf + f->offset;
-
-        memcpy(&opmask->opmask_regs, env->opmask_regs,
-               sizeof(env->opmask_regs));
-
-        for (i = 0; i < CPU_NB_REGS; i++) {
-            uint8_t *zmmh = zmm_hi256->zmm_hi256[i];
-
-            stq_p(zmmh,      env->xmm_regs[i].ZMM_Q(4));
-            stq_p(zmmh + 8,  env->xmm_regs[i].ZMM_Q(5));
-            stq_p(zmmh + 16, env->xmm_regs[i].ZMM_Q(6));
-            stq_p(zmmh + 24, env->xmm_regs[i].ZMM_Q(7));
-        }
-
-#ifdef TARGET_X86_64
-        f = &x86_ext_save_areas[XSTATE_Hi16_ZMM_BIT];
-        assert(f->size);
-        assert(f->offset);
-
-        hi16_zmm = buf + f->offset;
-
-        memcpy(&hi16_zmm->hi16_zmm, &env->xmm_regs[16],
-               16 * sizeof(env->xmm_regs[16]));
-#endif
-    }
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    e = &x86_ext_save_areas[XSTATE_OPMASK_BIT];
+//    if (e->size && e->offset) {
+//        XSaveOpmask *opmask;
+//        XSaveZMM_Hi256 *zmm_hi256;
+//#ifdef TARGET_X86_64
+//        XSaveHi16_ZMM *hi16_zmm;
+//#endif
+//
+//        f = &x86_ext_save_areas[XSTATE_ZMM_Hi256_BIT];
+//        assert(f->size);
+//        assert(f->offset);
+//
+//        opmask = buf + e->offset;
+//        zmm_hi256 = buf + f->offset;
+//
+//        memcpy(&opmask->opmask_regs, env->opmask_regs,
+//               sizeof(env->opmask_regs));
+//
+//        for (i = 0; i < CPU_NB_REGS; i++) {
+//            uint8_t *zmmh = zmm_hi256->zmm_hi256[i];
+//
+//            stq_p(zmmh,      env->xmm_regs[i].ZMM_Q(4));
+//            stq_p(zmmh + 8,  env->xmm_regs[i].ZMM_Q(5));
+//            stq_p(zmmh + 16, env->xmm_regs[i].ZMM_Q(6));
+//            stq_p(zmmh + 24, env->xmm_regs[i].ZMM_Q(7));
+//        }
+//
+//#ifdef TARGET_X86_64
+//        f = &x86_ext_save_areas[XSTATE_Hi16_ZMM_BIT];
+//        assert(f->size);
+//        assert(f->offset);
+//
+//        hi16_zmm = buf + f->offset;
+//
+//        memcpy(&hi16_zmm->hi16_zmm, &env->xmm_regs[16],
+//               16 * sizeof(env->xmm_regs[16]));
+//#endif
+//    }
 
 #ifdef TARGET_X86_64
     e = &x86_ext_save_areas[XSTATE_PKRU_BIT];
@@ -146,7 +152,8 @@ void x86_cpu_xsave_all_areas(X86CPU *cpu, void *buf, uint32_t buflen)
 void x86_cpu_xrstor_all_areas(X86CPU *cpu, const void *buf, uint32_t buflen)
 {
     CPUX86State *env = &cpu->env;
-    const ExtSaveArea *e, *f, *g;
+//    const ExtSaveArea *e, *f, *g;
+    const ExtSaveArea *e, *f;
     int i;
 
     const X86LegacyXSaveArea *legacy;
@@ -171,6 +178,7 @@ void x86_cpu_xrstor_all_areas(X86CPU *cpu, const void *buf, uint32_t buflen)
     env->fpip = legacy->fpip;
     env->fpdp = legacy->fpdp;
     env->mxcsr = legacy->mxcsr;
+    env->old_mxcsr = UINT32_MAX;
     memcpy(env->fpregs, &legacy->fpregs,
            sizeof(env->fpregs));
 
@@ -183,18 +191,21 @@ void x86_cpu_xrstor_all_areas(X86CPU *cpu, const void *buf, uint32_t buflen)
 
     env->xstate_bv = header->xstate_bv;
 
-    e = &x86_ext_save_areas[XSTATE_YMM_BIT];
-    if (e->size && e->offset) {
-        const XSaveAVX *avx;
-
-        avx = buf + e->offset;
-        for (i = 0; i < CPU_NB_REGS; i++) {
-            const uint8_t *ymmh = avx->ymmh[i];
-
-            env->xmm_regs[i].ZMM_Q(2) = ldq_p(ymmh);
-            env->xmm_regs[i].ZMM_Q(3) = ldq_p(ymmh + 8);
-        }
-    }
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    e = &x86_ext_save_areas[XSTATE_YMM_BIT];
+//    if (e->size && e->offset) {
+//        const XSaveAVX *avx;
+//
+//        avx = buf + e->offset;
+//        for (i = 0; i < CPU_NB_REGS; i++) {
+//            const uint8_t *ymmh = avx->ymmh[i];
+//
+//            env->xmm_regs[i].ZMM_Q(2) = ldq_p(ymmh);
+//            env->xmm_regs[i].ZMM_Q(3) = ldq_p(ymmh + 8);
+//        }
+//    }
 
     e = &x86_ext_save_areas[XSTATE_BNDREGS_BIT];
     if (e->size && e->offset) {
@@ -213,45 +224,48 @@ void x86_cpu_xrstor_all_areas(X86CPU *cpu, const void *buf, uint32_t buflen)
         env->bndcs_regs = bndcsr->bndcsr;
     }
 
-    e = &x86_ext_save_areas[XSTATE_OPMASK_BIT];
-    if (e->size && e->offset) {
-        const XSaveOpmask *opmask;
-        const XSaveZMM_Hi256 *zmm_hi256;
-#ifdef TARGET_X86_64
-        const XSaveHi16_ZMM *hi16_zmm;
-#endif
-
-        f = &x86_ext_save_areas[XSTATE_ZMM_Hi256_BIT];
-        assert(f->size);
-        assert(f->offset);
-
-        g = &x86_ext_save_areas[XSTATE_Hi16_ZMM_BIT];
-        assert(g->size);
-        assert(g->offset);
-
-        opmask = buf + e->offset;
-        zmm_hi256 = buf + f->offset;
-#ifdef TARGET_X86_64
-        hi16_zmm = buf + g->offset;
-#endif
-
-        memcpy(env->opmask_regs, &opmask->opmask_regs,
-               sizeof(env->opmask_regs));
-
-        for (i = 0; i < CPU_NB_REGS; i++) {
-            const uint8_t *zmmh = zmm_hi256->zmm_hi256[i];
-
-            env->xmm_regs[i].ZMM_Q(4) = ldq_p(zmmh);
-            env->xmm_regs[i].ZMM_Q(5) = ldq_p(zmmh + 8);
-            env->xmm_regs[i].ZMM_Q(6) = ldq_p(zmmh + 16);
-            env->xmm_regs[i].ZMM_Q(7) = ldq_p(zmmh + 24);
-        }
-
-#ifdef TARGET_X86_64
-        memcpy(&env->xmm_regs[16], &hi16_zmm->hi16_zmm,
-               16 * sizeof(env->xmm_regs[16]));
-#endif
-    }
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    e = &x86_ext_save_areas[XSTATE_OPMASK_BIT];
+//    if (e->size && e->offset) {
+//        const XSaveOpmask *opmask;
+//        const XSaveZMM_Hi256 *zmm_hi256;
+//#ifdef TARGET_X86_64
+//        const XSaveHi16_ZMM *hi16_zmm;
+//#endif
+//
+//        f = &x86_ext_save_areas[XSTATE_ZMM_Hi256_BIT];
+//        assert(f->size);
+//        assert(f->offset);
+//
+//        g = &x86_ext_save_areas[XSTATE_Hi16_ZMM_BIT];
+//        assert(g->size);
+//        assert(g->offset);
+//
+//        opmask = buf + e->offset;
+//        zmm_hi256 = buf + f->offset;
+//#ifdef TARGET_X86_64
+//        hi16_zmm = buf + g->offset;
+//#endif
+//
+//        memcpy(env->opmask_regs, &opmask->opmask_regs,
+//               sizeof(env->opmask_regs));
+//
+//        for (i = 0; i < CPU_NB_REGS; i++) {
+//            const uint8_t *zmmh = zmm_hi256->zmm_hi256[i];
+//
+//            env->xmm_regs[i].ZMM_Q(4) = ldq_p(zmmh);
+//            env->xmm_regs[i].ZMM_Q(5) = ldq_p(zmmh + 8);
+//            env->xmm_regs[i].ZMM_Q(6) = ldq_p(zmmh + 16);
+//            env->xmm_regs[i].ZMM_Q(7) = ldq_p(zmmh + 24);
+//        }
+//
+//#ifdef TARGET_X86_64
+//        memcpy(&env->xmm_regs[16], &hi16_zmm->hi16_zmm,
+//               16 * sizeof(env->xmm_regs[16]));
+//#endif
+//    }
 
 #ifdef TARGET_X86_64
     e = &x86_ext_save_areas[XSTATE_PKRU_BIT];

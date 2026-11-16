@@ -32,6 +32,9 @@
 #include "signal-common.h"
 #include "host-signal.h"
 #include "user/safe-syscall.h"
+#if defined(CONFIG_LATX_OPT) && !defined(CONFIG_LATX_TCG_MODE)
+#include "latx-sigfpe-sys.h"
+#endif
 
 static struct target_sigaction sigact_table[TARGET_NSIG];
 
@@ -804,6 +807,10 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
         abi_ptr guest_addr;
         bool is_write;
 
+#if defined(CONFIG_LATX_OPT) && !defined(CONFIG_LATX_TCG_MODE)
+        /* Capture LATX translated state before page unprotection unwinds it. */
+        latxs_save_sync_signal_state(cpu, puc);
+#endif
         host_addr = (uintptr_t)info->si_addr;
 
         /*

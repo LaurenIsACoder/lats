@@ -65,6 +65,7 @@ void gd_gl_area_draw(VirtualConsole *vc)
             } else {
                 dmabuf->draw_submitted = false;
             }
+            graphic_hw_gl_block(vc->gfx.dcl.con, true);
         }
 #endif
 
@@ -124,10 +125,6 @@ void gd_gl_area_refresh(DisplayChangeListener *dcl)
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
     gd_update_monitor_refresh_rate(vc, vc->window ? vc->window : vc->gfx.drawing_area);
-
-    if (vc->gfx.guest_fb.dmabuf && vc->gfx.guest_fb.dmabuf->draw_submitted) {
-        return;
-    }
 
     if (!vc->gfx.gls) {
         if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
@@ -286,7 +283,6 @@ void gd_gl_area_scanout_flush(DisplayChangeListener *dcl,
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
     if (vc->gfx.guest_fb.dmabuf && !vc->gfx.guest_fb.dmabuf->draw_submitted) {
-        graphic_hw_gl_block(vc->gfx.dcl.con, true);
         vc->gfx.guest_fb.dmabuf->draw_submitted = true;
         gtk_gl_area_set_scanout_mode(vc, true);
     }

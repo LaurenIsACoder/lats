@@ -4849,6 +4849,34 @@ SRST
   .. include:: ../qemu-option-trace.rst.inc
 
 ERST
+
+DEF("rrtrace", HAS_ARG, QEMU_OPTION_rrtrace,
+    "-rrtrace [[mode=]<pattern>]]\n"
+    "                tracing options for record replay\n",
+    QEMU_ARCH_ALL)
+SRST
+``-rrtrace [[mode=]pattern]``
+    trace in record replay
+ERST
+
+DEF("optbql", HAS_ARG, QEMU_OPTION_opt_bql,
+    "-optbql options\n"
+    "                optimize bql\n",
+    QEMU_ARCH_ALL)
+SRST
+``-optbql options``
+   optbql options 
+ERST
+
+DEF("latx", HAS_ARG, QEMU_OPTION_latx,
+    "-latx select,[options]\n"
+    "                latx options, see target/i386/latx/latx-options.c\n",
+    QEMU_ARCH_ALL)
+SRST
+``-latx options``
+   latx options 
+ERST
+
 DEF("plugin", HAS_ARG, QEMU_OPTION_plugin,
     "-plugin [file=]<file>[,<argname>=<argvalue>]\n"
     "                load a plugin\n",

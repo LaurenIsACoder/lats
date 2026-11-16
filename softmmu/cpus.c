@@ -23,6 +23,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "target/i386/latx/include/latx-options.h"
+#include "target/i386/latx/include/latx-sigrt-sys.h"
 #include "monitor/monitor.h"
 #include "qemu/coroutine-tls.h"
 #include "qapi/error.h"
@@ -35,6 +37,7 @@
 #include "exec/cpu-common.h"
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "qemu/plugin.h"
 #include "sysemu/cpus.h"
 #include "qemu/guest-random.h"
@@ -46,6 +49,11 @@
 #include "hw/boards.h"
 #include "hw/hw.h"
 #include "trace.h"
+
+#include "hamt-options.h"
+
+int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request);
+
 
 #ifdef CONFIG_LINUX
 
@@ -65,7 +73,7 @@
 
 #endif /* CONFIG_LINUX */
 
-static QemuMutex qemu_global_mutex;
+QemuMutex qemu_global_mutex;
 
 /*
  * The chosen accelerator is supposed to register this.
@@ -90,7 +98,11 @@ bool cpu_thread_is_idle(CPUState *cpu)
     if (cpu_is_stopped(cpu)) {
         return true;
     }
+#ifdef CONFIG_LATX_OPT
+    if (!cpu->halted || (x86_cpu_pending_interrupt(cpu, cpu->interrupt_request) != 0)) {
+#else
     if (!cpu->halted || cpu_has_work(cpu)) {
+#endif
         return false;
     }
     if (cpus_accel->cpu_thread_is_idle) {
@@ -400,7 +412,7 @@ static void qemu_cpu_stop(CPUState *cpu, bool exit)
     if (exit) {
         cpu_exit(cpu);
     }
-    qemu_cond_broadcast(&qemu_pause_cond);
+    qemu_cond_broadcast_1(&qemu_pause_cond);
 }
 
 void qemu_wait_io_event_common(CPUState *cpu)
@@ -412,17 +424,31 @@ void qemu_wait_io_event_common(CPUState *cpu)
     process_queued_cpu_work(cpu);
 }
 
+#ifdef CONFIG_LATX_PROFILER
+extern uint64_t latx_profile_cpu_halt_time[];
+#endif
+
+extern uint64_t qcondwait3_max;
 void qemu_wait_io_event(CPUState *cpu)
 {
     bool slept = false;
 
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t cpu_halt_st = latx_host_rdtime();
+#endif
     while (cpu_thread_is_idle(cpu)) {
         if (!slept) {
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
-        qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
-    }
+        qemu_cond_wait_3(cpu->halt_cond, &qemu_global_mutex, qcondwait3_max);
+	}
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t cpu_halt_ed = latx_host_rdtime();
+    uint64_t *cpu_halt_time_ptr = &latx_profile_cpu_halt_time[cpu->cpu_index];
+    qatomic_add(cpu_halt_time_ptr, (cpu_halt_ed - cpu_halt_st));
+#endif
+	
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);
     }
@@ -456,13 +482,15 @@ void cpus_kick_thread(CPUState *cpu)
 
 void qemu_cpu_kick(CPUState *cpu)
 {
-    qemu_cond_broadcast(cpu->halt_cond);
+    qemu_cond_broadcast_3(cpu->halt_cond);
     if (cpus_accel->kick_vcpu_thread) {
         cpus_accel->kick_vcpu_thread(cpu);
     } else { /* default */
         cpus_kick_thread(cpu);
     }
 }
+
+QEMU_DEFINE_STATIC_CO_TLS(bool, iothread_locked)
 
 void qemu_cpu_kick_self(void)
 {
@@ -479,8 +507,6 @@ bool qemu_in_vcpu_thread(void)
 {
     return current_cpu && qemu_cpu_is_self(current_cpu);
 }
-
-QEMU_DEFINE_STATIC_CO_TLS(bool, iothread_locked)
 
 bool qemu_mutex_iothread_locked(void)
 {
@@ -501,7 +527,43 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
 
     g_assert(!qemu_mutex_iothread_locked());
+#ifdef CONFIG_LATX_OPT_BQL
+    if (likely(bql_lock == qemu_bql_lock_impl)) {
+        pthread_spin_lock(&qemu_global_mutex.spin);
+    } else {
+        bql_lock(&qemu_global_mutex, file, line);
+    }
+#else
     bql_lock(&qemu_global_mutex, file, line);
+#endif
+    set_iothread_locked(true);
+}
+
+void qemu_mutex_lock_iothread_mmio_impl(const void *mr, const char *name,
+                                        uint64_t offset, bool is_write,
+                                        const char *file, int line)
+{
+    QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
+    bool profiling = unlikely(bql_lock != qemu_bql_lock_impl);
+    int64_t start = 0;
+
+    g_assert(!qemu_mutex_iothread_locked());
+    if (profiling) {
+        start = get_clock();
+    }
+#ifdef CONFIG_LATX_OPT_BQL
+    if (likely(!profiling)) {
+        pthread_spin_lock(&qemu_global_mutex.spin);
+    } else {
+        bql_lock(&qemu_global_mutex, file, line);
+    }
+#else
+    bql_lock(&qemu_global_mutex, file, line);
+#endif
+    if (profiling) {
+        qsp_record_mmio_bql(mr, name, offset, is_write,
+                            get_clock() - start);
+    }
     set_iothread_locked(true);
 }
 
@@ -509,16 +571,30 @@ void qemu_mutex_unlock_iothread(void)
 {
     g_assert(qemu_mutex_iothread_locked());
     set_iothread_locked(false);
+#ifdef CONFIG_LATX_OPT_BQL
+    pthread_spin_unlock(&qemu_global_mutex.spin);
+#else
     qemu_mutex_unlock(&qemu_global_mutex);
+#endif
+    if (option_int_opt == IRQ_CHECK_ASYNC_NOTIFY && !current_cpu) {
+        lats_notify_after_iothread_unlock();
+    }
 }
 
 void qemu_cond_wait_iothread(QemuCond *cond)
 {
-    qemu_cond_wait(cond, &qemu_global_mutex);
+    qemu_cond_wait_1(cond, &qemu_global_mutex);
+}
+
+void qemu_cond_wait_2_iothread(QemuCond *cond)
+{
+    qemu_cond_wait_2(cond, &qemu_global_mutex);
 }
 
 void qemu_cond_timedwait_iothread(QemuCond *cond, int ms)
 {
+		printf("%s \n", __func__);
+    pthread_spin_unlock(&qemu_global_mutex.spin);
     qemu_cond_timedwait(cond, &qemu_global_mutex, ms);
 }
 
@@ -526,14 +602,14 @@ void qemu_cond_timedwait_iothread(QemuCond *cond, int ms)
 void cpu_thread_signal_created(CPUState *cpu)
 {
     cpu->created = true;
-    qemu_cond_signal(&qemu_cpu_cond);
+    qemu_cond_signal_1(&qemu_cpu_cond);
 }
 
 /* signal CPU destruction */
 void cpu_thread_signal_destroyed(CPUState *cpu)
 {
     cpu->created = false;
-    qemu_cond_signal(&qemu_cpu_cond);
+    qemu_cond_signal_1(&qemu_cpu_cond);
 }
 
 
@@ -570,7 +646,7 @@ void pause_all_vcpus(void)
     replay_mutex_unlock();
 
     while (!all_vcpus_paused()) {
-        qemu_cond_wait(&qemu_pause_cond, &qemu_global_mutex);
+        qemu_cond_wait_1(&qemu_pause_cond, &qemu_global_mutex);
         CPU_FOREACH(cpu) {
             qemu_cpu_kick(cpu);
         }
@@ -645,10 +721,17 @@ void qemu_init_vcpu(CPUState *cpu)
 
     /* accelerators all implement the AccelOpsClass */
     g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
+
+    offline_cpu = cpu;
+
     cpus_accel->create_vcpu_thread(cpu);
 
     while (!cpu->created) {
+#ifdef CONFIG_LATX_OPT
+        qemu_cond_wait_1(&qemu_cpu_cond, &qemu_global_mutex);
+#else
         qemu_cond_wait(&qemu_cpu_cond, &qemu_global_mutex);
+#endif
     }
 }
 
@@ -825,4 +908,3 @@ void qmp_inject_nmi(Error **errp)
 {
     nmi_monitor_handle(monitor_get_cpu_index(monitor_cur()), errp);
 }
-

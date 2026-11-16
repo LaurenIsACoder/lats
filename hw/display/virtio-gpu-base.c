@@ -231,6 +231,24 @@ virtio_gpu_base_get_features(VirtIODevice *vdev, uint64_t features,
     }
     if (virtio_gpu_blob_enabled(g->conf)) {
         features |= (1 << VIRTIO_GPU_F_RESOURCE_BLOB);
+#if defined(__linux__) && defined(HAVE_VIRGL_RESOURCE_MAP_FIXED)
+        /*
+         * RESOURCE_SYNC_BLOB is meaningful only for resources which are
+         * fixed-mapped from external dma-bufs.  Advertising it for ordinary
+         * hostmem blobs makes the guest select coherent mappings and then
+         * every sync fails because those resources have no map_fixed state.
+         */
+        if (object_dynamic_cast(OBJECT(g), TYPE_VIRTIO_GPU_GL) &&
+            VIRTIO_GPU_GL(g)->external_blob) {
+            features |= (1 << VIRTIO_GPU_F_RESOURCE_SYNC_BLOB);
+        }
+#endif
+    }
+    if (virtio_gpu_context_init_enabled(g->conf)) {
+        features |= (1 << VIRTIO_GPU_F_CONTEXT_INIT);
+    }
+    if (virtio_gpu_resource_uuid_enabled(g->conf)) {
+        features |= (1 << VIRTIO_GPU_F_RESOURCE_UUID);
     }
 
     return features;
@@ -248,7 +266,11 @@ void
 virtio_gpu_base_device_unrealize(DeviceState *qdev)
 {
     VirtIOGPUBase *g = VIRTIO_GPU_BASE(qdev);
+    VirtIODevice *vdev = VIRTIO_DEVICE(qdev);
 
+    virtio_del_queue(vdev, 0);
+    virtio_del_queue(vdev, 1);
+    virtio_cleanup(vdev);
     if (g->migration_blocker) {
         migrate_del_blocker(g->migration_blocker);
         error_free(g->migration_blocker);

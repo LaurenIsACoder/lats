@@ -27,6 +27,8 @@
 #include "exec/log.h"
 #include "helper-tcg.h"
 #include "seg_helper.h"
+#include "../include/latx-options.h"
+#include "../hamt/hamt.h"
 
 int get_pg_mode(CPUX86State *env)
 {
@@ -62,6 +64,18 @@ int get_pg_mode(CPUX86State *env)
         }
     }
     return pg_mode;
+}
+
+int update_hamt_en(CPUX86State *env)
+{
+    if (!hamt_enabled())
+        return 0;
+    if (get_pg_mode(env) == 0x1000f) {
+        env->hflags |= HF_HAMT_EN_MASK;
+    } else {
+        env->hflags &= ~HF_HAMT_EN_MASK;
+    }
+    return 1;
 }
 
 /* return non zero if error */
@@ -977,6 +991,17 @@ static void do_interrupt64(CPUX86State *env, int intno, int is_int,
                    e2);
     env->eip = offset;
 }
+
+void lats_do_interrupt64(CPUX86State *env, int intno, int is_int,
+        int error_code, target_ulong next_eip, int is_hw);
+void lats_do_interrupt64(CPUX86State *env, int intno, int is_int,
+        int error_code, target_ulong next_eip, int is_hw)
+{
+    env->old_exception = intno;
+    do_interrupt64(env, intno, is_int, error_code, next_eip, is_hw);
+    env->old_exception = -1;
+}
+
 #endif /* TARGET_X86_64 */
 
 void helper_sysret(CPUX86State *env, int dflag)
@@ -1865,6 +1890,9 @@ void helper_iret_real(CPUX86State *env, int shift)
     }
     cpu_load_eflags(env, new_eflags, eflags_mask);
     env->hflags2 &= ~HF2_NMI_MASK;
+#if !defined(CONFIG_USER_ONLY) && defined(__loongarch__) && defined(CONFIG_LATX_HACK_MEM)
+    hamt_native_resume_iret(env);
+#endif
 }
 
 static inline void validate_seg(CPUX86State *env, X86Seg seg_reg, int cpl)
@@ -2143,6 +2171,9 @@ void helper_iret_protected(CPUX86State *env, int shift, int next_eip)
         helper_ret_protected(env, shift, 1, 0, GETPC());
     }
     env->hflags2 &= ~HF2_NMI_MASK;
+#if !defined(CONFIG_USER_ONLY) && defined(__loongarch__) && defined(CONFIG_LATX_HACK_MEM)
+    hamt_native_resume_iret(env);
+#endif
 }
 
 void helper_lret_protected(CPUX86State *env, int shift, int addend)
@@ -2262,11 +2293,17 @@ target_ulong helper_lsl(CPUX86State *env, target_ulong selector1)
         if (dpl < cpl || dpl < rpl) {
         fail:
             CC_SRC = eflags & ~CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
             return 0;
         }
     }
     limit = get_seg_limit(e1, e2);
     CC_SRC = eflags | CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
     return limit;
 }
 
@@ -2312,10 +2349,16 @@ target_ulong helper_lar(CPUX86State *env, target_ulong selector1)
         if (dpl < cpl || dpl < rpl) {
         fail:
             CC_SRC = eflags & ~CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
             return 0;
         }
     }
     CC_SRC = eflags | CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
     return e2 & 0x00f0ff00;
 }
 
@@ -2351,10 +2394,16 @@ void helper_verr(CPUX86State *env, target_ulong selector1)
         if (dpl < cpl || dpl < rpl) {
         fail:
             CC_SRC = eflags & ~CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
             return;
         }
     }
     CC_SRC = eflags | CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 void helper_verw(CPUX86State *env, target_ulong selector1)
@@ -2385,8 +2434,14 @@ void helper_verw(CPUX86State *env, target_ulong selector1)
         if (!(e2 & DESC_W_MASK)) {
         fail:
             CC_SRC = eflags & ~CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
             return;
         }
     }
     CC_SRC = eflags | CC_Z;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }

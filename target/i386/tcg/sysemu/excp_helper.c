@@ -21,6 +21,10 @@
 #include "cpu.h"
 #include "exec/exec-all.h"
 #include "tcg/helper-tcg.h"
+#include "tcg/fast-itlb.h"
+
+#include "sysemu/rr.h"
+#include "exec/ram_addr.h"
 
 typedef struct TranslateParams {
     target_ulong addr;
@@ -58,6 +62,7 @@ typedef struct PTETranslate {
     hwaddr gaddr;
 } PTETranslate;
 
+#ifndef CONFIG_LATX_HACK_MEM
 static bool ptw_translate(PTETranslate *inout, hwaddr addr)
 {
     CPUTLBEntryFull *full;
@@ -80,6 +85,7 @@ static bool ptw_translate(PTETranslate *inout, hwaddr addr)
     }
     return true;
 }
+#endif
 
 static inline uint32_t ptw_ldl(const PTETranslate *in)
 {
@@ -130,9 +136,217 @@ static inline bool ptw_setl(const PTETranslate *in, uint32_t old, uint32_t set)
     return true;
 }
 
+#include "latx-hack.h"
+
+static bool mmu_translate_fast(
+        CPUX86State *env, const TranslateParams *in,
+        TranslateResult *out, TranslateFault *err)
+{
+    const target_ulong addr = in->addr;
+    const MMUAccessType access_type = in->access_type;
+    uint64_t ptep, pte, rsvd_mask;
+    PTETranslate pte_trans = {
+        .env = env,
+        .err = err,
+        .ptw_idx = in->ptw_idx,
+    };
+    hwaddr pte_addr, paddr;
+    int page_size;
+    int error_code;
+#ifdef CONFIG_LATX_HACK_MEM
+    uint64_t rambase = HACK_RAMBASE;
+#endif
+
+restart:
+    rsvd_mask = 0x000fff0000000000LL;
+
+    pte = in->cr3;
+    ptep = PG_NX_MASK | PG_USER_MASK | PG_RW_MASK;
+
+    /*
+     * Page table level 4
+     */
+    pte_addr = ((pte & PG_ADDRESS_MASK) + (((addr >> 39) & 0x1ff) << 3));
+#ifdef CONFIG_LATX_HACK_MEM
+    pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
+    if (!latx_fast_gpa_to_hva(env, pte_addr, (uint64_t *)&pte_trans.haddr)) {
+        if (!ptw_translate(&pte_trans, pte_addr)) return false;
+    }
+#endif
+    /*pte = ptw_ldq(&pte_trans);*/
+    pte = *((uint64_t *)pte_trans.haddr);
+    if (!(pte & PG_PRESENT_MASK)) goto do_fault;
+    if (pte & (rsvd_mask | PG_PSE_MASK)) goto do_fault_rsvd;
+
+    if (!ptw_setl(&pte_trans, pte, PG_ACCESSED_MASK)) {
+        goto restart;
+    }
+    pte |= PG_ACCESSED_MASK;
+    ptep &= pte ^ PG_NX_MASK;
+
+    /*
+     * Page table level 3
+     */
+    pte_addr = ((pte & PG_ADDRESS_MASK) + (((addr >> 30) & 0x1ff) << 3));
+#ifdef CONFIG_LATX_HACK_MEM
+    pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
+    if (!latx_fast_gpa_to_hva(env, pte_addr, (uint64_t *)&pte_trans.haddr)) {
+        if (!ptw_translate(&pte_trans, pte_addr)) return false;
+    }
+#endif
+    /*pte = ptw_ldq(&pte_trans);*/
+    pte = *((uint64_t *)pte_trans.haddr);
+    if (!(pte & PG_PRESENT_MASK)) goto do_fault;
+    if (pte & rsvd_mask) goto do_fault_rsvd;
+    if (!ptw_setl(&pte_trans, pte, PG_ACCESSED_MASK)) {
+        goto restart;
+    }
+    pte |= PG_ACCESSED_MASK;
+    ptep &= pte ^ PG_NX_MASK;
+    if (pte & PG_PSE_MASK) {
+        /* 1 GB page */
+        page_size = 1024 * 1024 * 1024;
+        goto do_check_protect;
+    }
+
+    /*
+     * Page table level 2
+     */
+    pte_addr = ((pte & PG_ADDRESS_MASK) + (((addr >> 21) & 0x1ff) << 3));
+#ifdef CONFIG_LATX_HACK_MEM
+    pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
+    if (!latx_fast_gpa_to_hva(env, pte_addr, (uint64_t *)&pte_trans.haddr)) {
+        if (!ptw_translate(&pte_trans, pte_addr)) return false;
+    }
+#endif
+    /*pte = ptw_ldq(&pte_trans);*/
+    pte = *((uint64_t *)pte_trans.haddr);
+    if (!(pte & PG_PRESENT_MASK)) goto do_fault;
+    if (pte & rsvd_mask) goto do_fault_rsvd;
+    if (pte & PG_PSE_MASK) {
+        /* 2 MB page */
+        page_size = 2048 * 1024;
+        ptep &= pte ^ PG_NX_MASK;
+        goto do_check_protect;
+    }
+    if (!ptw_setl(&pte_trans, pte, PG_ACCESSED_MASK)) {
+        goto restart;
+    }
+    pte |= PG_ACCESSED_MASK;
+    ptep &= pte ^ PG_NX_MASK;
+
+    /*
+     * Page table level 1
+     */
+    pte_addr = ((pte & PG_ADDRESS_MASK) + (((addr >> 12) & 0x1ff) << 3));
+#ifdef CONFIG_LATX_HACK_MEM
+    pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
+    if (!latx_fast_gpa_to_hva(env, pte_addr, (uint64_t *)&pte_trans.haddr)) {
+        if (!ptw_translate(&pte_trans, pte_addr)) return false;
+    }
+#endif
+    pte = ptw_ldq(&pte_trans);
+    if (!(pte & PG_PRESENT_MASK)) goto do_fault;
+    if (pte & rsvd_mask) goto do_fault_rsvd;
+    /* combine pde and pte nx, user and rw protections */
+    ptep &= pte ^ PG_NX_MASK;
+    page_size = 4096;
+
+do_check_protect:
+    rsvd_mask |= (page_size - 1) & PG_ADDRESS_MASK & ~PG_PSE_PAT_MASK;
+    if (pte & rsvd_mask) goto do_fault_rsvd;
+    ptep ^= PG_NX_MASK;
+
+    /* can the page can be put in the TLB?  prot will tell us */
+    if (!(ptep & PG_USER_MASK)) goto do_fault_protect;
+
+    int prot = 0;
+    if (in->mmu_idx != MMU_KSMAP_IDX || !(ptep & PG_USER_MASK)) {
+        prot |= PAGE_READ;
+        if ((ptep & PG_RW_MASK)) prot |= PAGE_WRITE;
+    }
+    if (!(ptep & PG_NX_MASK)) prot |= PAGE_EXEC;
+
+    if ((prot & (1 << access_type)) == 0) {
+        goto do_fault_protect;
+    }
+
+    /* yes, it can! */
+    {
+        uint32_t set = PG_ACCESSED_MASK;
+        if (access_type == MMU_DATA_STORE) {
+            set |= PG_DIRTY_MASK;
+        } else if (!(pte & PG_DIRTY_MASK)) {
+            /*
+             * Only set write access if already dirty...
+             * otherwise wait for dirty access.
+             */
+            prot &= ~PAGE_WRITE;
+        }
+        if (!ptw_setl(&pte_trans, pte, set)) {
+            goto restart;
+        }
+    }
+
+    /* align to page_size */
+    paddr = (pte & PG_ADDRESS_MASK & ~(page_size - 1))
+          | (addr & (page_size - 1));
+
+    out->paddr = paddr;
+    out->prot = prot;
+    out->page_size = page_size;
+    return true;
+
+ do_fault_rsvd:
+    error_code = PG_ERROR_RSVD_MASK;
+    goto do_fault_cont;
+ do_fault_protect:
+    error_code = PG_ERROR_P_MASK;
+    goto do_fault_cont;
+ do_fault:
+    error_code = 0;
+ do_fault_cont:
+    error_code |= PG_ERROR_U_MASK;
+    if (access_type == MMU_DATA_STORE) {
+        error_code |= PG_ERROR_W_MASK;
+    }
+    *err = (TranslateFault){
+        .exception_index = EXCP0E_PAGE,
+        .error_code = error_code,
+        .cr2 = addr,
+    };
+    return false;
+}
+
 static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                           TranslateResult *out, TranslateFault *err)
 {
+    /* PAE(0) LMA(1) NXE(2) PSE(3) WP(16) */
+    if (qemu_tcg_fast_mmu_enabled() &&
+        in->pg_mode == 0x1000f &&
+        in->mmu_idx == MMU_USER_IDX &&
+        (in->access_type == MMU_DATA_LOAD ||
+         in->access_type == MMU_DATA_STORE))
+    {
+#ifdef CONFIG_LATX_PRINT
+        static __thread int use_fast = 1; 
+        if (use_fast) {
+            use_fast = 0;
+            CPUState *cpu = env_cpu(env);
+            printf("CPU[%d] start to use fast mmu transalte on page mode 0x%x\n",
+                    cpu->cpu_index, in->pg_mode);
+        }
+#endif
+        return mmu_translate_fast(env, in, out, err);
+    }
+
+#ifdef CONFIG_LATX_HACK_MEM
+    uint64_t rambase = HACK_RAMBASE;
+#endif
     const int32_t a20_mask = x86_get_a20_mask(env);
     const target_ulong addr = in->addr;
     const int pg_mode = in->pg_mode;
@@ -160,14 +374,19 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
 #ifdef TARGET_X86_64
         if (pg_mode & PG_MODE_LMA) {
             if (pg_mode & PG_MODE_LA57) {
+                rr_counter_record(RR_EVENT_PGMODE_PAE_LMA_LA57);
                 /*
                  * Page table level 5
                  */
                 pte_addr = ((in->cr3 & ~0xfff) +
                             (((addr >> 48) & 0x1ff) << 3)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+                pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
                 if (!ptw_translate(&pte_trans, pte_addr)) {
                     return false;
                 }
+#endif
             restart_5:
                 pte = ptw_ldq(&pte_trans);
                 if (!(pte & PG_PRESENT_MASK)) {
@@ -181,6 +400,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                 }
                 ptep = pte ^ PG_NX_MASK;
             } else {
+                rr_counter_record(RR_EVENT_PGMODE_PAE_LMA);
                 pte = in->cr3;
                 ptep = PG_NX_MASK | PG_USER_MASK | PG_RW_MASK;
             }
@@ -190,9 +410,14 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
              */
             pte_addr = ((pte & PG_ADDRESS_MASK) +
                         (((addr >> 39) & 0x1ff) << 3)) & a20_mask;
+
+#ifdef CONFIG_LATX_HACK_MEM
+            pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
             if (!ptw_translate(&pte_trans, pte_addr)) {
                 return false;
             }
+#endif
         restart_4:
             pte = ptw_ldq(&pte_trans);
             if (!(pte & PG_PRESENT_MASK)) {
@@ -209,11 +434,16 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             /*
              * Page table level 3
              */
+
             pte_addr = ((pte & PG_ADDRESS_MASK) +
                         (((addr >> 30) & 0x1ff) << 3)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+            pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
             if (!ptw_translate(&pte_trans, pte_addr)) {
                 return false;
             }
+#endif
         restart_3_lma:
             pte = ptw_ldq(&pte_trans);
             if (!(pte & PG_PRESENT_MASK)) {
@@ -234,13 +464,18 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         } else
 #endif
         {
+            rr_counter_record(RR_EVENT_PGMODE_PAE);
             /*
              * Page table level 3
              */
             pte_addr = ((in->cr3 & ~0x1f) + ((addr >> 27) & 0x18)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+            pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
             if (!ptw_translate(&pte_trans, pte_addr)) {
                 return false;
             }
+#endif
             rsvd_mask |= PG_HI_USER_MASK;
         restart_3_nolma:
             pte = ptw_ldq(&pte_trans);
@@ -261,9 +496,13 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          */
         pte_addr = ((pte & PG_ADDRESS_MASK) +
                     (((addr >> 21) & 0x1ff) << 3)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+        pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
         if (!ptw_translate(&pte_trans, pte_addr)) {
             return false;
         }
+#endif
     restart_2_pae:
         pte = ptw_ldq(&pte_trans);
         if (!(pte & PG_PRESENT_MASK)) {
@@ -288,9 +527,13 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          */
         pte_addr = ((pte & PG_ADDRESS_MASK) +
                     (((addr >> 12) & 0x1ff) << 3)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+        pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
         if (!ptw_translate(&pte_trans, pte_addr)) {
             return false;
         }
+#endif
         pte = ptw_ldq(&pte_trans);
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
@@ -302,13 +545,18 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         ptep &= pte ^ PG_NX_MASK;
         page_size = 4096;
     } else {
+        rr_counter_record(RR_EVENT_PGMODE_ZERO);
         /*
          * Page table level 2
          */
         pte_addr = ((in->cr3 & ~0xfff) + ((addr >> 20) & 0xffc)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+        pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
         if (!ptw_translate(&pte_trans, pte_addr)) {
             return false;
         }
+#endif
     restart_2_nopae:
         pte = ptw_ldl(&pte_trans);
         if (!(pte & PG_PRESENT_MASK)) {
@@ -335,9 +583,13 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
          * Page table level 1
          */
         pte_addr = ((pte & ~0xfffu) + ((addr >> 10) & 0xffc)) & a20_mask;
+#ifdef CONFIG_LATX_HACK_MEM
+        pte_trans.haddr = (void *)pte_addr + rambase; /* HVA = GPA + rambase */
+#else
         if (!ptw_translate(&pte_trans, pte_addr)) {
             return false;
         }
+#endif
         pte = ptw_ldl(&pte_trans);
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
@@ -610,6 +862,16 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
                                 out.paddr & TARGET_PAGE_MASK,
                                 cpu_get_mem_attrs(env),
                                 out.prot, mmu_idx, out.page_size);
+        if (access_type == MMU_INST_FETCH) {
+            int mmu_idx = cpu_mmu_index(env, false);
+            CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
+            uint64_t tlb_addr = tlb_read_idx(entry, access_type);
+            if (tlb_hit(tlb_addr, addr)) {
+                void *p = (void *)addr + entry->addend;
+                uint64_t tb_page_addr = qemu_ram_addr_from_host_nofail(p);
+                cpu_fast_itlb_fill(cs, mmu_idx, addr, tb_page_addr, out.prot);
+            }
+        }
         return true;
     }
 
@@ -630,6 +892,11 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
                      err.cr2);
     } else {
         env->cr[2] = err.cr2;
+    }
+    if (rr_counter_enabled()) {
+        int cpl = (env->hflags & HF_CPL_MASK) >> HF_CPL_SHIFT;
+        if (cpl == 0) { rr_counter_record(RR_EVENT_PF_CPL0); }
+        if (cpl == 3) { rr_counter_record(RR_EVENT_PF_CPL3); }
     }
     raise_exception_err_ra(env, err.exception_index, err.error_code, retaddr);
 }

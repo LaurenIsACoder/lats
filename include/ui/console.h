@@ -342,6 +342,7 @@ void qemu_displaysurface_win32_set_handle(DisplaySurface *surface,
 PixelFormat qemu_default_pixelformat(int bpp);
 
 DisplaySurface *qemu_create_displaysurface(int width, int height);
+DisplaySurface *qemu_create_displaysurface_bpp(int width, int height, int bpp);
 void qemu_free_displaysurface(DisplaySurface *surface);
 
 static inline int is_buffer_shared(DisplaySurface *surface)

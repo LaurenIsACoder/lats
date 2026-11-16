@@ -111,6 +111,7 @@ void cpu_enable_ticks(void)
     if (!timers_state.cpu_ticks_enabled) {
         timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
         timers_state.cpu_clock_offset -= get_clock();
+        timers_state.cpu_clock_offset_ticks = timers_state.cpu_clock_offset / 10;
         timers_state.cpu_ticks_enabled = 1;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
@@ -129,6 +130,7 @@ void cpu_disable_ticks(void)
     if (timers_state.cpu_ticks_enabled) {
         timers_state.cpu_ticks_offset += cpu_get_host_ticks();
         timers_state.cpu_clock_offset = cpu_get_clock_locked();
+        timers_state.cpu_clock_offset_ticks = timers_state.cpu_clock_offset / 10;
         timers_state.cpu_ticks_enabled = 0;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
@@ -266,12 +268,17 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
 
 TimersState timers_state;
 
+void *timers_state_ptr;
+int ts_offset_cpu_clock_offset;
+
 /* initialize timers state and the cpu throttle for convenience */
 void cpu_timers_init(void)
 {
     seqlock_init(&timers_state.vm_clock_seqlock);
     qemu_spin_init(&timers_state.vm_clock_lock);
     vmstate_register(NULL, 0, &vmstate_timers, &timers_state);
+    timers_state_ptr = &timers_state;
+    ts_offset_cpu_clock_offset = offsetof(TimersState, cpu_clock_offset_ticks);
 
     cpu_throttle_init();
 }

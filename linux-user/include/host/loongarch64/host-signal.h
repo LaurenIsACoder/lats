@@ -11,6 +11,8 @@
 #ifndef LOONGARCH64_HOST_SIGNAL_H
 #define LOONGARCH64_HOST_SIGNAL_H
 
+#include "loongarch-extcontext.h"
+
 /* The third argument to a SA_SIGINFO handler is ucontext_t. */
 typedef ucontext_t host_sigcontext;
 
@@ -26,7 +28,14 @@ static inline void host_signal_set_pc(host_sigcontext *uc, uintptr_t pc)
 
 static inline void *host_signal_mask(host_sigcontext *uc)
 {
+#ifndef LOONGARCH_NEW_WORLD
+    /* Old-world libc describes a smaller mcontext than the kernel supplies.
+     * uc_sigmask overlaps saved LBT state; use the kernel ABI offset, as LAT
+     * does, so blocking signals cannot overwrite guest arithmetic flags. */
+    return (char *)&uc->uc_mcontext + 0x1540;
+#else
     return &uc->uc_sigmask;
+#endif
 }
 
 static inline bool host_signal_write(siginfo_t *info, host_sigcontext *uc)
@@ -58,6 +67,13 @@ static inline bool host_signal_write(siginfo_t *info, host_sigcontext *uc)
         case 0b0111: /* st.d */
         case 0b1101: /* fst.s */
         case 0b1111: /* fst.d */
+            return true;
+        }
+        break;
+    case 0b001011: /* LSX/LASX immediate vector loads and stores */
+        switch ((insn >> 22) & 0b1111) {
+        case 0b0001: /* vst */
+        case 0b0011: /* xvst */
             return true;
         }
         break;

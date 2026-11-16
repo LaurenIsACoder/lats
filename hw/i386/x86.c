@@ -42,6 +42,8 @@
 
 #include "hw/i386/x86.h"
 #include "target/i386/cpu.h"
+#include "target/i386/latx/include/latx-options.h"
+#include "qemu/timer.h"
 #include "hw/i386/topology.h"
 #include "hw/i386/fw_cfg.h"
 #include "hw/intc/i8259.h"
@@ -537,7 +539,17 @@ static long get_file_size(FILE *f)
 /* TSC handling */
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
-    return cpus_get_elapsed_ticks();
+    if (qemu_tcg_mode_2_lat() &&
+        (option_opt_rdtsc_rdtscp ||
+         (env->features[FEAT_8000_0007_EDX] & CPUID_APM_INVTSC))) {
+        /* Match the fixed-rate counter used by translated RDTSC/RDTSCP. */
+        uint64_t ticks = cpu_get_host_ticks();
+#ifdef CONFIG_TSC_FREQ
+        ticks *= option_opt_rdtsc_freq;
+#endif
+        return ticks + env->tsc_base_offset;
+    }
+    return cpus_get_elapsed_ticks() + env->tsc_base_offset;
 }
 
 /* IRQ handling */

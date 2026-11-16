@@ -171,6 +171,11 @@ void helper_aam(CPUX86State *env, int base)
     al = al % base;
     env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | al | (ah << 8);
     CC_DST = al;
+    //CC_SRC = compute_all_logicb(al, 0);
+    CC_SRC = helper_cc_compute_all(CC_DST, 0, 0, CC_OP_LOGICB);
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 void helper_aad(CPUX86State *env, int base)
@@ -182,6 +187,11 @@ void helper_aad(CPUX86State *env, int base)
     al = ((ah * base) + al) & 0xff;
     env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | al;
     CC_DST = al;
+    //CC_SRC = compute_all_logicb(al, 0);
+    CC_SRC = helper_cc_compute_all(CC_DST, 0, 0, CC_OP_LOGICB);
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 void helper_aaa(CPUX86State *env)
@@ -206,6 +216,9 @@ void helper_aaa(CPUX86State *env)
     }
     env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | al | (ah << 8);
     CC_SRC = eflags;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 void helper_aas(CPUX86State *env)
@@ -230,6 +243,9 @@ void helper_aas(CPUX86State *env)
     }
     env->regs[R_EAX] = (env->regs[R_EAX] & ~0xffff) | al | (ah << 8);
     CC_SRC = eflags;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 void helper_daa(CPUX86State *env)
@@ -257,6 +273,9 @@ void helper_daa(CPUX86State *env)
     eflags |= parity_table[al]; /* pf */
     eflags |= (al & 0x80); /* sf */
     CC_SRC = eflags;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 void helper_das(CPUX86State *env)
@@ -288,6 +307,9 @@ void helper_das(CPUX86State *env)
     eflags |= parity_table[al]; /* pf */
     eflags |= (al & 0x80); /* sf */
     CC_SRC = eflags;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
 }
 
 #ifdef TARGET_X86_64

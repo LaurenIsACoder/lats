@@ -47,10 +47,13 @@ QEMU_BUILD_BUG_ON(sizeof(CPUTLBEntry) != (1 << CPU_TLB_ENTRY_BITS));
  * The structure is aligned to aid loading the pair with one insn.
  */
 typedef struct CPUTLBDescFast {
+    void *spt;
+    void *itlb;
     /* Contains (n_entries - 1) << CPU_TLB_ENTRY_BITS */
     uintptr_t mask;
     /* The array of tlb entries itself. */
     CPUTLBEntry *table;
-} CPUTLBDescFast QEMU_ALIGNED(2 * sizeof(void *));
+    //void *__unused;
+} CPUTLBDescFast QEMU_ALIGNED(4 * sizeof(void *));
 
 #endif /* EXEC_TLB_COMMON_H */

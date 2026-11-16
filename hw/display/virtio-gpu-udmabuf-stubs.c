@@ -26,3 +26,8 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
     /* nothing (stub) */
     return 0;
 }
+
+void virtio_gpu_release_scanout_dmabuf(VirtIOGPU *g, int scanout_id)
+{
+    /* nothing (stub) */
+}

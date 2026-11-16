@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/rcu.h"
 #include "qemu/interval-tree.h"
 #include "qemu/qtree.h"
 #include "exec/cputlb.h"
@@ -30,7 +31,17 @@
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "internal.h"
-
+#include "hamt-tlb.h"
+#ifndef CONFIG_USER_ONLY
+#include "hamt.h"
+#endif
+#include "latx/include/latx-ras.h"
+#include "latx/include/latx-config.h"
+#include "latx/include/latx-options.h"
+#include "latx/include/latx-shadow-htable.h"
+#include "latx/include/latx-misc.h"
+#include "latx/include/sys-aot.h"
+#include "latx/include/latx-tu.h"
 
 /* List iterators for lists of tagged pointers in TranslationBlock. */
 #define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
@@ -46,7 +57,7 @@ static bool tb_cmp(const void *ap, const void *bp)
     const TranslationBlock *a = ap;
     const TranslationBlock *b = bp;
 
-    return (a->pc == b->pc &&
+    return ((tb_cflags(a) & CF_PCREL ||a->pc == b->pc) &&
             a->cs_base == b->cs_base &&
             a->flags == b->flags &&
             (tb_cflags(a) & ~CF_INVALID) == (tb_cflags(b) & ~CF_INVALID) &&
@@ -54,11 +65,35 @@ static bool tb_cmp(const void *ap, const void *bp)
             tb_page_addr1(a) == tb_page_addr1(b));
 }
 
+static size_t tb_htable_initial_capacity(void)
+{
+    unsigned bits = option_tb_htable_bits ? option_tb_htable_bits :
+                                          CODE_GEN_HTABLE_BITS;
+    return (size_t)1 << bits;
+}
+
+void *(*tb_qht_lookup)(const struct qht *, const void *, uint32_t,
+                       qht_lookup_func_t) = qht_lookup_custom;
+
 void tb_htable_init(void)
 {
     unsigned int mode = QHT_MODE_AUTO_RESIZE;
+    tb_qht_lookup = option_arch_opt ? qht_lookup_custom_unrolled :
+                                     qht_lookup_custom;
 
-    qht_init(&tb_ctx.htable, tb_cmp, CODE_GEN_HTABLE_SIZE, mode);
+    tb_ctx.n = qemu_tcg_mtcc_enabled() ? MTCC_NR : 1;
+
+    for (int i = 0; i < tb_ctx.n; ++i) {
+        qht_init(&tb_ctx.htable[i], tb_cmp, tb_htable_initial_capacity(), mode);
+    }
+    if (option_tb_htable_bits) {
+        fprintf(stderr, "LATS_TB_HTABLE_INITIAL bits=%u capacity=%zu "
+                "tables=%d buckets=%zu auto_resize=1\n",
+                option_tb_htable_bits, tb_htable_initial_capacity(), tb_ctx.n,
+                qht_n_buckets(&tb_ctx.htable[0]));
+    }
+
+    flaged_shadow_htable_init();
 }
 
 typedef struct PageDesc PageDesc;
@@ -121,6 +156,8 @@ static void tb_remove(TranslationBlock *tb)
          N = foreach_tb_next(T, start, last);           \
          T != NULL;                                     \
          T = N, N = foreach_tb_next(N, start, last))
+#define PAGE_FOR_EACH_TB_MTCC(start, last, pagedesc, tb, n, mtcc_id) \
+    PAGE_FOR_EACH_TB(start, last, pagedesc, tb, n)
 
 typedef TranslationBlock *PageForEachNext;
 
@@ -177,10 +214,26 @@ static int v_l2_levels;
 
 static void *l1_map[V_L1_MAX_SIZE];
 
+#ifdef CONFIG_LATX_TU
+/* Source-only pages need not contain any original TB byte range. */
+typedef struct NativeSourceOwner {
+    TranslationBlock *owner;
+    struct NativeSourceOwner *next;
+} NativeSourceOwner;
+#endif
+
 struct PageDesc {
     QemuSpin lock;
     /* list of TBs intersecting this ram page */
-    uintptr_t first_tb;
+    uintptr_t first_tb[MTCC_NR];
+#ifdef CONFIG_LATX_TU
+    NativeSourceOwner *native_source_owners[MTCC_NR];
+#endif
+    /*record pre gva and aot flags. */
+    uint64_t aot_mesage;
+    /* AOT TU page lookup cache; generation zero marks an invalid entry. */
+    uint64_t aot_tu_file_offset;
+    uint32_t aot_tu_cache_generation;
 };
 
 void page_table_config_init(void)
@@ -244,6 +297,7 @@ static PageDesc *page_find_alloc(tb_page_addr_t index, bool alloc)
         pd = g_new0(PageDesc, V_L2_SIZE);
         for (int i = 0; i < V_L2_SIZE; i++) {
             qemu_spin_init(&pd[i].lock);
+            pd[i].aot_mesage = PAGE_NO_LOAD;
         }
 
         existing = qatomic_cmpxchg(lp, NULL, pd);
@@ -262,6 +316,48 @@ static PageDesc *page_find_alloc(tb_page_addr_t index, bool alloc)
 static inline PageDesc *page_find(tb_page_addr_t index)
 {
     return page_find_alloc(index, false);
+}
+
+uint64_t get_page_aot_mesage(tb_page_addr_t addr)
+{
+    PageDesc *pd = page_find(addr);
+    if (pd) {
+        return pd->aot_mesage;
+    }
+    return 0;
+
+}
+
+/* Need hold lock when call this function. */
+void set_page_aot_mesage(tb_page_addr_t addr, uint8_t flags, vaddr gva)
+{
+    PageDesc *pd = page_find_alloc(addr, true);
+    gva &= TARGET_PAGE_MASK;
+    pd->aot_mesage = gva | flags;
+}
+
+bool get_page_aot_tu_cache(tb_page_addr_t addr, AOTTUPageCache *cache)
+{
+    PageDesc *pd = page_find(addr);
+
+    if (!pd) {
+        memset(cache, 0, sizeof(*cache));
+        return false;
+    }
+
+    cache->file_offset = pd->aot_tu_file_offset;
+    cache->file_generation = pd->aot_tu_cache_generation;
+    return cache->file_generation != 0;
+}
+
+void set_page_aot_tu_cache(tb_page_addr_t addr, uint32_t file_generation,
+        uint64_t file_offset)
+{
+    PageDesc *pd = page_find_alloc(addr, true);
+
+    g_assert(file_generation != 0);
+    pd->aot_tu_file_offset = file_offset;
+    pd->aot_tu_cache_generation = file_generation;
 }
 
 /**
@@ -310,7 +406,9 @@ struct page_collection {
 
 typedef int PageForEachNext;
 #define PAGE_FOR_EACH_TB(start, last, pagedesc, tb, n) \
-    TB_FOR_EACH_TAGGED((pagedesc)->first_tb, tb, n, page_next)
+    TB_FOR_EACH_TAGGED((pagedesc)->first_tb[0], tb, n, page_next)
+#define PAGE_FOR_EACH_TB_MTCC(start, last, pagedesc, tb, n, mtcc_id) \
+    TB_FOR_EACH_TAGGED((pagedesc)->first_tb[mtcc_id], tb, n, page_next)
 
 #ifdef CONFIG_DEBUG_TCG
 
@@ -397,11 +495,105 @@ static void page_unlock(PageDesc *pd)
     page_unlock__debug(pd);
 }
 
+static bool page_locked(PageDesc *pd)
+{
+    return pd ? qemu_spin_locked(&pd->lock) : false;
+}
+
+#ifdef CONFIG_LATX_TU
+/* Page locks protect lists; region flush clears heads before memory reuse. */
+static void native_source_prune(PageDesc *pd, unsigned mtcc_id)
+{
+    NativeSourceOwner **link = &pd->native_source_owners[mtcc_id];
+
+    assert_page_locked(pd);
+    while (*link) {
+        if (tb_cflags((*link)->owner) & CF_INVALID) {
+            *link = (*link)->next;
+        } else {
+            link = &(*link)->next;
+        }
+    }
+}
+
+bool tb_register_native_source_pages(TranslationBlock *owner)
+{
+    TranslationUnitPages *pages = TB_TU_PAGES(owner);
+    tb_page_addr_t physical[TRANSLATION_UNIT_MAX_PAGES];
+    PageDesc *descs[TRANSLATION_UNIT_MAX_PAGES];
+    unsigned count = 0;
+    unsigned mtcc_id = get_mask_from_miscflags(owner,
+            MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+    NativeSourceOwner *links;
+
+    assert_memory_lock();
+    if (!pages || !tb_is_tu(owner) || mtcc_id >= tb_ctx.n) {
+        return false;
+    }
+    for (unsigned i = 0; ; i++) {
+        uint64_t packed = pages->pages[i].vp_phys_hi;
+
+        if (packed == UINT64_MAX) {
+            break;
+        }
+        if (i == TRANSLATION_UNIT_MAX_PAGES) {
+            return false;
+        }
+        tb_page_addr_t pp = tu_page_desc_phys(packed, pages->pages[i].mix);
+        bool duplicate = false;
+        for (unsigned j = 0; j < count; j++) {
+            duplicate |= physical[j] == pp;
+        }
+        if (duplicate) {
+            continue;
+        }
+        PageDesc *pd = page_find(pp >> TARGET_PAGE_BITS);
+        if (!pd) {
+            return false;
+        }
+        assert_page_locked(pd);
+        physical[count] = pp;
+        descs[count++] = pd;
+    }
+    if (!count) {
+        return false;
+    }
+    /* Allocate before publishing any node; failure leaves no partial list. */
+    links = tcg_region_alloc_data(tcg_ctx, count * sizeof(*links));
+    if (!links) {
+        return false;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        native_source_prune(descs[i], mtcc_id);
+        links[i].owner = owner;
+        links[i].next = descs[i]->native_source_owners[mtcc_id];
+        descs[i]->native_source_owners[mtcc_id] = &links[i];
+    }
+    return true;
+}
+#endif
+
+bool tb_page_locked(tb_page_addr_t paddr)
+{
+    return page_locked(page_find_alloc(paddr >> TARGET_PAGE_BITS, false));
+}
+
 void tb_lock_page0(tb_page_addr_t paddr)
 {
     page_lock(page_find_alloc(paddr >> TARGET_PAGE_BITS, true));
 }
 
+bool tb_trylock_page0(tb_page_addr_t paddr)
+{
+    bool busy = page_trylock(page_find_alloc(paddr >> TARGET_PAGE_BITS, true));
+    return busy;
+}
+void tb_unlock_page0(tb_page_addr_t paddr)
+{
+    page_unlock(page_find_alloc(paddr >> TARGET_PAGE_BITS, false));
+}
+
+#include "../../target/i386/latx/include/lsenv.h"
 void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
 {
     tb_page_addr_t pindex0 = paddr0 >> TARGET_PAGE_BITS;
@@ -433,7 +625,13 @@ void tb_lock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
     page_unlock(pd0);
     page_lock(pd1);
     page_lock(pd0);
-    siglongjmp(tcg_ctx->jmp_trans, -3);
+
+    if (qemu_tcg_mode_2_lat()) {
+        TRANSLATION_DATA *td = lsenv->tr_data;
+        td->deadlock_avoidance = __GENCODE_ERR_PAGE_LOCK_RETRY;
+    } else {
+        siglongjmp(tcg_ctx->jmp_trans, -3);
+    }
 }
 
 void tb_unlock_page1(tb_page_addr_t paddr0, tb_page_addr_t paddr1)
@@ -481,6 +679,39 @@ void tb_unlock_pages(TranslationBlock *tb)
         page_unlock(page_find_alloc(pindex1, false));
     }
     page_unlock(page_find_alloc(pindex0, false));
+}
+
+void tb_unlock_tu_pages(void);
+
+void tb_unlock_ctx_pages(int reset)
+{
+    if (lsenv->tr_data->is_tu_mode && cp_tu_pages()) {
+        tb_unlock_tu_pages();
+        if (reset) {
+            tcg_ctx->pre_locked_page0 = -1;
+            tcg_ctx->pre_locked_page1 = -1;
+        }
+        return;
+    }
+    if (tcg_ctx->pre_locked_page1 != -1) {
+        if (tcg_ctx->pre_locked_page1 != tcg_ctx->pre_locked_page0) {
+            tb_unlock_page0(tcg_ctx->pre_locked_page1);
+        }
+        if (reset) tcg_ctx->pre_locked_page1 = -1;
+    }
+    if (tcg_ctx->pre_locked_page0 != -1) {
+        tb_unlock_page0(tcg_ctx->pre_locked_page0);
+        if (reset) tcg_ctx->pre_locked_page0 = -1;
+    }
+}
+
+void unlock_page(uint64 addr)
+{
+    addr >>= TARGET_PAGE_BITS;
+    if (unlikely(addr == -1)) {
+        return;
+    }
+    page_unlock(page_find_alloc(addr, false));
 }
 
 static inline struct page_entry *
@@ -629,14 +860,55 @@ static struct page_collection *page_collection_lock(tb_page_addr_t start,
             goto retry;
         }
         assert_page_locked(pd);
-        PAGE_FOR_EACH_TB(unused, unused, pd, tb, n) {
-            if (page_trylock_add(set, tb_page_addr0(tb)) ||
+        uint32_t n_mtcc = qemu_tcg_mtcc_enabled()?MTCC_NR:1;
+        for (uint32_t mtcc_id = 0; mtcc_id < n_mtcc; ++mtcc_id) {
+#ifdef CONFIG_LATX_TU
+        native_source_prune(pd, mtcc_id);
+        for (NativeSourceOwner *link = pd->native_source_owners[mtcc_id];
+             link; link = link->next) {
+            TranslationUnitPages *sources = TB_TU_PAGES(link->owner);
+            for (unsigned i = 0; i < TRANSLATION_UNIT_MAX_PAGES + 1; i++) {
+                uint64_t packed = sources->pages[i].vp_phys_hi;
+                if (packed == UINT64_MAX) {
+                    break;
+                }
+                tb_page_addr_t pp = tu_page_desc_phys(packed,
+                                                     sources->pages[i].mix);
+                if (page_trylock_add(set, pp)) {
+                    q_tree_foreach(set->tree, page_entry_unlock, NULL);
+                    goto retry;
+                }
+            }
+        }
+#endif
+        PAGE_FOR_EACH_TB_MTCC(unused, unused, pd, tb, n, mtcc_id) {
+            bool retry_needed = page_trylock_add(set, tb_page_addr0(tb)) ||
                 (tb_page_addr1(tb) != -1 &&
-                 page_trylock_add(set, tb_page_addr1(tb)))) {
+                 page_trylock_add(set, tb_page_addr1(tb)));
+#ifdef CONFIG_LATX_TU
+            if (!retry_needed && tb_is_tu(tb) && TB_TU_PAGES(tb)) {
+                for (int i = 0; i < TRANSLATION_UNIT_MAX_PAGES + 1; i++) {
+                    uint64_t packed_vp =
+                        TB_TU_PAGES(tb)->pages[i].vp_phys_hi;
+
+                    if (packed_vp == UINT64_MAX) {
+                        break;
+                    }
+                    tb_page_addr_t pp = tu_page_desc_phys(packed_vp,
+                            TB_TU_PAGES(tb)->pages[i].mix);
+                    if (page_trylock_add(set, pp)) {
+                        retry_needed = true;
+                        break;
+                    }
+                }
+            }
+#endif
+            if (retry_needed) {
                 /* drop all locks, and reacquire in order */
                 q_tree_foreach(set->tree, page_entry_unlock, NULL);
                 goto retry;
             }
+        }
         }
     }
     return set;
@@ -652,7 +924,7 @@ static void page_collection_unlock(struct page_collection *set)
 /* Set to NULL all the 'first_tb' fields in all PageDescs. */
 static void tb_remove_all_1(int level, void **lp)
 {
-    int i;
+    int i, r;
 
     if (*lp == NULL) {
         return;
@@ -662,7 +934,15 @@ static void tb_remove_all_1(int level, void **lp)
 
         for (i = 0; i < V_L2_SIZE; ++i) {
             page_lock(&pd[i]);
-            pd[i].first_tb = (uintptr_t)NULL;
+            for (r = 0; r < MTCC_NR; ++r) {
+                pd[i].first_tb[r] = (uintptr_t)NULL;
+#ifdef CONFIG_LATX_TU
+                pd[i].native_source_owners[r] = NULL;
+#endif
+                if (pd[i].aot_mesage & PAGE_LOADED) {
+                    pd[i].aot_mesage = PAGE_NO_LOAD;
+                }
+            }
             page_unlock(&pd[i]);
         }
     } else {
@@ -683,6 +963,80 @@ static void tb_remove_all(void)
     }
 }
 
+static void tb_remove_all_1_mtcc(int level, void **lp, uint32_t mtcc_id)
+{
+    int i;
+
+    if (*lp == NULL) {
+        return;
+    }
+    if (level == 0) {
+        PageDesc *pd = *lp;
+
+        for (i = 0; i < V_L2_SIZE; ++i) {
+            page_lock(&pd[i]);
+            pd[i].first_tb[mtcc_id] = (uintptr_t)NULL;
+#ifdef CONFIG_LATX_TU
+            pd[i].native_source_owners[mtcc_id] = NULL;
+#endif
+            if (pd[i].aot_mesage & PAGE_LOADED) {
+                pd[i].aot_mesage = PAGE_NO_LOAD;
+            }
+            page_unlock(&pd[i]);
+        }
+    } else {
+        void **pp = *lp;
+
+        for (i = 0; i < V_L2_SIZE; ++i) {
+            tb_remove_all_1_mtcc(level - 1, pp + i, mtcc_id);
+        }
+    }
+}
+
+static void tb_remove_mtcc(uint32_t mtcc_id)
+{
+    assert(qemu_tcg_mtcc_enabled());
+
+    int i, l1_sz = v_l1_size;
+
+    for (i = 0; i < l1_sz; i++) {
+        tb_remove_all_1_mtcc(v_l2_levels, l1_map + i, mtcc_id);
+    }
+}
+
+static void unlock_all_page_1_mtcc(int level, void **lp, uint32_t mtcc_id)
+{
+    int i;
+
+    if (*lp == NULL) {
+        return;
+    }
+    if (level == 0) {
+        PageDesc *pd = *lp;
+
+        for (i = 0; i < V_L2_SIZE; ++i) {
+            page_unlock(&pd[i]);
+        }
+    } else {
+        void **pp = *lp;
+
+        for (i = 0; i < V_L2_SIZE; ++i) {
+            unlock_all_page_1_mtcc(level - 1, pp + i, mtcc_id);
+        }
+    }
+}
+
+void unlock_all_page(uint32_t mtcc_id)
+{
+    assert(qemu_tcg_mtcc_enabled());
+
+    int i, l1_sz = v_l1_size;
+
+    for (i = 0; i < l1_sz; i++) {
+        unlock_all_page_1_mtcc(v_l2_levels, l1_map + i, mtcc_id);
+    }
+}
+
 /*
  * Add the tb in the target page and protect it if necessary.
  * Called with @p->lock held.
@@ -693,9 +1047,12 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
 
     assert_page_locked(p);
 
-    tb->page_next[n] = p->first_tb;
-    page_already_protected = p->first_tb != 0;
-    p->first_tb = (uintptr_t)tb | n;
+    uint32_t mtcc_id = get_mask_from_miscflags(tb,
+            MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+
+    tb->page_next[n] = p->first_tb[mtcc_id];
+    page_already_protected = p->first_tb[mtcc_id] != 0;
+    p->first_tb[mtcc_id] = (uintptr_t)tb | n;
 
     /*
      * If some code is already present, then the pages are already
@@ -712,7 +1069,7 @@ static void tb_record(TranslationBlock *tb)
     tb_page_addr_t paddr0 = tb_page_addr0(tb);
     tb_page_addr_t paddr1 = tb_page_addr1(tb);
     tb_page_addr_t pindex0 = paddr0 >> TARGET_PAGE_BITS;
-    tb_page_addr_t pindex1 = paddr0 >> TARGET_PAGE_BITS;
+    tb_page_addr_t pindex1 = paddr1 >> TARGET_PAGE_BITS;
 
     assert(paddr0 != -1);
     if (unlikely(paddr1 != -1) && pindex0 != pindex1) {
@@ -727,9 +1084,12 @@ static void tb_page_remove(PageDesc *pd, TranslationBlock *tb)
     uintptr_t *pprev;
     PageForEachNext n1;
 
+    uint32_t mtcc_id = get_mask_from_miscflags(tb,
+            MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+
     assert_page_locked(pd);
-    pprev = &pd->first_tb;
-    PAGE_FOR_EACH_TB(unused, unused, pd, tb1, n1) {
+    pprev = &pd->first_tb[mtcc_id];
+    PAGE_FOR_EACH_TB_MTCC(unused, unused, pd, tb1, n1, mtcc_id) {
         if (tb1 == tb) {
             *pprev = tb1->page_next[n1];
             return;
@@ -744,7 +1104,7 @@ static void tb_remove(TranslationBlock *tb)
     tb_page_addr_t paddr0 = tb_page_addr0(tb);
     tb_page_addr_t paddr1 = tb_page_addr1(tb);
     tb_page_addr_t pindex0 = paddr0 >> TARGET_PAGE_BITS;
-    tb_page_addr_t pindex1 = paddr0 >> TARGET_PAGE_BITS;
+    tb_page_addr_t pindex1 = paddr1 >> TARGET_PAGE_BITS;
 
     assert(paddr0 != -1);
     if (unlikely(paddr1 != -1) && pindex0 != pindex1) {
@@ -767,13 +1127,25 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
     did_flush = true;
 
     CPU_FOREACH(cpu) {
+        if (option_rastoptp) latxs_flush_soft_ras(cpu);
         tcg_flush_jmp_cache(cpu);
+        cpu->env_ptr->syscall_tb = NULL;
+#ifdef CONFIG_LATX_TU
+        tu_generation_invalidate(cpu);
+#endif
     }
 
-    qht_reset_size(&tb_ctx.htable, CODE_GEN_HTABLE_SIZE);
+    for (int i = 0; i < tb_ctx.n; ++i) {
+        qht_reset_size(&tb_ctx.htable[i], tb_htable_initial_capacity());
+    }
+    flaged_shadow_htable_reset();
     tb_remove_all();
 
     tcg_region_reset_all();
+    aot_reloc_reset_on_tb_flush(-1);
+#ifdef CONFIG_LATX_TU
+    tu_generation_reset_ids();
+#endif
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
 
@@ -784,8 +1156,67 @@ done:
     }
 }
 
+static void do_tb_flush_mtcc(CPUState *cpu, run_on_cpu_data data)
+{
+    uint32_t count = data.host_ulong & (uint64_t)0xffffffff;
+    uint32_t mtcc_id = (data.host_ulong >> 32) & (uint64_t)0xffffffff;
+
+    aot_save_on_tb_flush(mtcc_id);
+    bool did_flush = false;
+
+    mmap_lock();
+    /* If it is already been done on request of another CPU, just retry. */
+    if (tb_ctx.tb_flush_count_mtcc[mtcc_id] != count) {
+        goto done;
+    }
+    did_flush = true;
+
+#ifdef CONFIG_LATX_PRINT
+    printf("%s tb flush mtcc %d count %d\n", __func__,
+            mtcc_id, count);
+#endif
+
+    CPU_FOREACH(cpu) {
+        if (option_rastoptp && cpu->env_ptr->ras_tp.initialized &&
+            cpu->env_ptr->ras_tp.mtcc_id == mtcc_id) {
+            latxs_flush_soft_ras(cpu);
+        }
+        tcg_flush_jmp_cache(cpu);
+        cpu->env_ptr->syscall_tb = NULL;
+#ifdef CONFIG_LATX_TU
+        /* TU generation is restricted to CPL3, which uses MTCC 1. */
+        if (mtcc_id == 1) {
+            tu_generation_invalidate(cpu);
+        }
+#endif
+    }
+
+    qht_reset_size(&tb_ctx.htable[mtcc_id], tb_htable_initial_capacity());
+    flaged_shadow_htable_reset_mtcc(mtcc_id);
+#if !defined(CONFIG_USER_ONLY)
+    tb_remove_mtcc(mtcc_id);
+#endif
+
+    tcg_region_reset_mtcc(mtcc_id);
+    aot_reloc_reset_on_tb_flush(mtcc_id);
+#ifdef CONFIG_LATX_TU
+    if (mtcc_id == 1) {
+        tu_generation_reset_ids();
+    }
+#endif
+    /* XXX: flush processor icache at this point if cache flush is expensive */
+    qatomic_inc(&tb_ctx.tb_flush_count_mtcc[mtcc_id]);
+
+done:
+    mmap_unlock();
+    if (did_flush) {
+        qemu_plugin_flush_cb();
+    }
+}
+
 void tb_flush(CPUState *cpu)
 {
+    assert(qemu_tcg_flush_full());
     if (tcg_enabled()) {
         unsigned tb_flush_count = qatomic_read(&tb_ctx.tb_flush_count);
 
@@ -795,6 +1226,27 @@ void tb_flush(CPUState *cpu)
             async_safe_run_on_cpu(cpu, do_tb_flush,
                                   RUN_ON_CPU_HOST_INT(tb_flush_count));
         }
+    }
+}
+
+void tb_flush_mtcc(CPUState *cpu, uint32_t mtcc_id)
+{
+    assert(qemu_tcg_flush_full());
+    if (qemu_tcg_mtcc_enabled() && tcg_enabled()) {
+        assert(mtcc_id < tb_ctx.n);
+        uint32_t count = qatomic_read(&tb_ctx.tb_flush_count_mtcc[mtcc_id]);
+
+        uint64_t data = ((uint64_t)mtcc_id << 32) | count;
+        if (cpu_in_serial_context(cpu) &&
+            (!option_sys_aot || !option_aot_save ||
+             get_ptr_rcu_reader()->depth == 0)) {
+            do_tb_flush_mtcc(cpu, RUN_ON_CPU_HOST_ULONG(data));
+        } else {
+            async_safe_run_on_cpu(cpu, do_tb_flush_mtcc,
+                                  RUN_ON_CPU_HOST_ULONG(data));
+        }
+    } else {
+        tb_flush(cpu);
     }
 }
 
@@ -847,6 +1299,32 @@ static inline void tb_remove_from_jmp_list(TranslationBlock *orig, int n_orig)
     g_assert_not_reached();
 }
 
+void unlink_old_dest(TranslationBlock *tb, TranslationBlock *dest, int n_orig)
+{
+    TranslationBlock *last;
+    uintptr_t *pprev;
+    int n;
+
+
+    qemu_spin_lock(&dest->jmp_lock);
+    if ((uintptr_t)dest != qatomic_read(&tb->jmp_dest[n_orig])) {
+        qemu_spin_unlock(&dest->jmp_lock);
+        return;
+    }
+    pprev = &dest->jmp_list_head;
+    TB_FOR_EACH_JMP(dest, last, n) {
+        if (last == tb && n == n_orig) {
+            *pprev = last->jmp_list_next[n];
+            latx_tb_reset_jmp_target(tb, n);
+            qatomic_set(&tb->jmp_dest[n_orig], (uintptr_t)NULL);
+            qemu_spin_unlock(&dest->jmp_lock);
+            return;
+        }
+        pprev = &last->jmp_list_next[n];
+    }
+    g_assert_not_reached();
+}
+
 /*
  * Reset the jump entry 'n' of a TB so that it is not chained to another TB.
  */
@@ -865,7 +1343,11 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     qemu_spin_lock(&dest->jmp_lock);
 
     TB_FOR_EACH_JMP(dest, tb, n) {
-        tb_reset_jump(tb, n);
+        if (qemu_tcg_mode_2_lat()) {
+            latx_tb_reset_jmp_target(tb, n);
+        } else {
+            tb_reset_jump(tb, n);
+        }
         qatomic_and(&tb->jmp_dest[n], (uintptr_t)NULL | 1);
         /* No need to clear the list entry; setting the dest ptr is enough */
     }
@@ -874,24 +1356,33 @@ static inline void tb_jmp_unlink(TranslationBlock *dest)
     qemu_spin_unlock(&dest->jmp_lock);
 }
 
+void latxs_tb_jmp_unlink(TranslationBlock *dest);
+void latxs_tb_jmp_unlink(TranslationBlock *dest)
+{
+    tb_jmp_unlink(dest);
+}
+
 static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
 {
     CPUState *cpu;
+    /* Kernel MMIO discovery can invalidate a kernel TB after its region
+     * was rebuilt. TP RAS never stores kernel targets. User aliases of the
+     * same physical page still pass through this function separately. */
+    bool flush_ras = option_soft_ras &&
+        (!option_rastoptp || (tb->flags & HF_CPL_MASK) == HF_CPL_MASK);
 
     if (tb_cflags(tb) & CF_PCREL) {
         /* A TB may be at any virtual address */
         CPU_FOREACH(cpu) {
+            if (option_rastoptp && flush_ras) latxs_flush_soft_ras(cpu);
             tcg_flush_jmp_cache(cpu);
         }
     } else {
-        uint32_t h = tb_jmp_cache_hash_func(tb->pc);
-
         CPU_FOREACH(cpu) {
-            CPUJumpCache *jc = cpu->tb_jmp_cache;
-
-            if (qatomic_read(&jc->array[h].tb) == tb) {
-                qatomic_set(&jc->array[h].tb, NULL);
+            if (flush_ras) {
+                latxs_flush_soft_ras(cpu);
             }
+            tb_jmp_cache_invalidate(cpu, tb->pc, tb);
         }
     }
 }
@@ -906,29 +1397,50 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     uint32_t h;
     tb_page_addr_t phys_pc;
     uint32_t orig_cflags = tb_cflags(tb);
+    uint32_t mtcc_id = get_mask_from_miscflags(tb,
+            MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
 
     assert_memory_lock();
 
+    if (tb_is_hras_private(tb) && (orig_cflags & CF_INVALID)) {
+        return;
+    }
+
     /* make sure no further incoming jumps will be chained to this TB */
     qemu_spin_lock(&tb->jmp_lock);
-    qatomic_set(&tb->cflags, tb->cflags | CF_INVALID);
+    uint32_t cflags = (tb->cflags | CF_INVALID) & ~CF_NO_ACTIVE;
+    qatomic_set(&tb->cflags, cflags);
+#ifndef CONFIG_USER_ONLY
+    /* Inactive AOT templates point into the file, not executable code. */
+    if (!(orig_cflags & CF_NO_ACTIVE)) {
+        hamt_poison_tb_entry(tb);
+    }
+#endif
+    latxs_ras_unlink_target_locked(tb);
     qemu_spin_unlock(&tb->jmp_lock);
+
+    /* CF_INVALID must be visible before either jump cache is cleared. */
+    tb_jmp_cache_inval_tb(tb);
+
+    /* Remove this TB's outgoing software-RAS edge as well. */
+    latxs_ras_unlink(tb);
 
     /* remove the TB from the hash list */
     phys_pc = tb_page_addr0(tb);
-    h = tb_hash_func(phys_pc, tb->pc,
+    h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
                      tb->flags, tb->cs_base, orig_cflags);
-    if (!qht_remove(&tb_ctx.htable, tb, h)) {
-        return;
+    /* Private return members own pages and edges, but no global hash key. */
+    if (!tb_is_hras_private(tb)) {
+        flaged_shadow_htable_remove(tb);
+        if (!qht_remove(&tb_ctx.htable[mtcc_id], tb, h)) {
+            return;
+        }
     }
 
     /* remove the TB from the page list */
     if (rm_from_page_list) {
         tb_remove(tb);
     }
-
-    /* remove the TB from the hash list */
-    tb_jmp_cache_inval_tb(tb);
 
     /* suppress this TB from the two jump lists */
     tb_remove_from_jmp_list(tb, 0);
@@ -944,7 +1456,40 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 static void tb_phys_invalidate__locked(TranslationBlock *tb)
 {
     qemu_thread_jit_write();
+#ifdef CONFIG_LATX_TU
+    if (tb->flags & HF_CPL_MASK) {
+        if (tb_is_tu(tb)) {
+            if (tb->s_data->next_tb[1]) {
+                TranslationBlock *next_tb = tb->s_data->next_tb[1];
+                while(next_tb) {
+                    if (!next_tb->s_data->is_invalidate) {
+                        do_tb_phys_invalidate(next_tb, true);
+                        next_tb->s_data->is_invalidate = true;
+                    }
+                    next_tb = next_tb->s_data->next_tb[1];
+                }
+            }
+            if (tb->s_data->next_tb[0]) {
+                TranslationBlock *pre_tb = tb->s_data->next_tb[0];
+                while(pre_tb) {
+                    if (!pre_tb->s_data->is_invalidate) {
+                        do_tb_phys_invalidate(pre_tb, true);
+                        pre_tb->s_data->is_invalidate = true;
+                    }
+                    pre_tb = pre_tb->s_data->next_tb[0];
+                }
+            }
+            do_tb_phys_invalidate(tb, true);
+            tb->s_data->is_invalidate = true;
+        } else {
+            do_tb_phys_invalidate(tb, true);
+        }
+    } else {
+        do_tb_phys_invalidate(tb, true);
+    }
+#else
     do_tb_phys_invalidate(tb, true);
+#endif
     qemu_thread_jit_execute();
 }
 
@@ -983,18 +1528,184 @@ TranslationBlock *tb_link_page(TranslationBlock *tb)
     tb_record(tb);
 
     /* add in the hash table */
-    h = tb_hash_func(tb_page_addr0(tb), tb->pc,
+    h = tb_hash_func(tb_page_addr0(tb), (tb->cflags & CF_PCREL ? 0 : tb->pc),
                      tb->flags, tb->cs_base, tb->cflags);
-    qht_insert(&tb_ctx.htable, tb, h, &existing_tb);
+
+    uint32_t mtcc_id = 0;
+
+re_insert:
+    if (qemu_tcg_mtcc_enabled()) {
+        mtcc_id = get_mask_from_miscflags(tb,
+                MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+        assert(mtcc_id == curr_mtcc(current_cpu->env_ptr));
+        qht_insert(&tb_ctx.htable[mtcc_id], tb, h, &existing_tb);
+    } else {
+        qht_insert(&tb_ctx.htable[0], tb, h, &existing_tb);
+    }
 
     /* remove TB from the page(s) if we couldn't insert it */
     if (unlikely(existing_tb)) {
+        /* Just a test for aot. */
+        if (((TranslationBlock *)existing_tb)->cflags & CF_INVALID) {
+            qht_remove(&tb_ctx.htable[mtcc_id], existing_tb, h);
+            existing_tb = NULL;
+            fprintf(stderr, "existing_tb is CF_INVALID\n");
+            goto re_insert;
+        }
+        if (option_tu_hras && tb_is_tu(tb) &&
+            !(tb->bool_flags & IS_AOT_TB)) {
+            /* Keep the canonical lookup target and this TU's local code.
+             * tb_record above must remain live for SMC and page unmapping. */
+            tb->s_data->tu_tb_mode = TU_TB_MODE_HRAS_PRIVATE;
+            return tb;
+        }
         tb_remove(tb);
-        tb_unlock_pages(tb);
         return existing_tb;
     }
 
-    tb_unlock_pages(tb);
+    flaged_shadow_htable_insert(tb);
+    return tb;
+}
+
+TranslationBlock *aot_tb_link_page(TranslationBlock *tb, bool keep_hras_private)
+{
+    void *existing_tb = NULL;
+    uint32_t h;
+
+    assert_memory_lock();
+    tcg_debug_assert(!(tb->cflags & CF_INVALID));
+
+    tb_record(tb);
+
+    /* add in the hash table */
+    h = tb_hash_func(tb_page_addr0(tb), (tb->cflags & CF_PCREL ? 0 : tb->pc),
+                     tb->flags, tb->cs_base, tb->cflags);
+
+    if (qemu_tcg_mtcc_enabled()) {
+        uint32_t mtcc_id = get_mask_from_miscflags(tb,
+                MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+        assert(mtcc_id == curr_mtcc(current_cpu->env_ptr));
+        qht_insert(&tb_ctx.htable[mtcc_id], tb, h, &existing_tb);
+    } else {
+        qht_insert(&tb_ctx.htable[0], tb, h, &existing_tb);
+    }
+
+    /* remove TB from the page(s) if we couldn't insert it */
+    if (unlikely(existing_tb)) {
+        if (keep_hras_private) {
+            /* The proved paired ordinary TU owns this local continuation.
+             * Keep its page/edge registration and the old canonical key. */
+            g_assert(tb_is_tu(tb));
+            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+            return existing_tb;
+        }
+        if (((TranslationBlock *)existing_tb)->cflags & CF_INVALID) {
+            fprintf(stderr, "aot_tb_link_page existing_tb is CF_INVALID bool flags %x\n",
+                    ((TranslationBlock *)existing_tb)->bool_flags);
+        }
+        tb_remove(tb);
+        /* tb_unlock_pages(tb); */
+        return existing_tb;
+    }
+
+    flaged_shadow_htable_insert(tb);
+    /* tb_unlock_pages(tb); */
+    return tb;
+}
+
+#ifdef CONFIG_LATX_TU
+/* The complete new TU is executable before the first member is published.
+ * Both its source pages and every expected old owner's pages remain locked.
+ * A collision leaves the new member private; it is never freed or invalidated
+ * because a concurrent reader can already hold another member of this TU. */
+TranslationBlock *aot_tb_replace_page(TranslationBlock *tb,
+                                     TranslationBlock *expected)
+{
+    void *existing = NULL;
+    unsigned mtcc = qemu_tcg_mtcc_enabled() ?
+        get_mask_from_miscflags(tb, MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT) : 0;
+    uint32_t h = tb_hash_func(tb_page_addr0(tb), tb->pc, tb->flags,
+                              tb->cs_base, tb_cflags(tb));
+    struct qht *table = &tb_ctx.htable[mtcc];
+
+    assert_memory_lock();
+    tb_record(tb);
+    if (expected) {
+        existing = qht_lookup(table, expected, h);
+        if (existing != expected ||
+            (tb_cflags(expected) & (CF_INVALID | CF_NO_ACTIVE)) ||
+            (expected->bool_flags & IS_AOT_TB) ||
+            !qht_remove(table, expected, h)) {
+            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+            return existing;
+        }
+        /* Keep every old edge, page-list entry and host-PC registration.
+         * The store/load barrier pairs with the C cache insertion recheck. */
+        qatomic_set(&expected->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+        smp_mb();
+        flaged_shadow_htable_remove(expected);
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            tb_jmp_cache_invalidate(cpu, expected->pc, expected);
+        }
+    }
+    existing = NULL;
+    if (qht_insert(table, tb, h, &existing)) {
+        flaged_shadow_htable_insert(tb);
+        return tb;
+    }
+    /* Never displace an object that failed the caller's exact preflight.
+     * The full native owner/records and page registration remain valid, even
+     * if other members were published before this unexpected collision. */
+    qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+    return existing;
+}
+#endif
+
+TranslationBlock *aot_tb_relink_page(TranslationBlock *tb)
+{
+    void *existing_tb = NULL;
+    uint32_t h;
+    uint32_t mtcc_id = get_mask_from_miscflags(tb,
+            MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+    assert_memory_lock();
+    /* Only an unexecuted file template may be activated. Executed entries
+     * can be poisoned and retain their old identity until code flush. */
+    if (!(tb_cflags(tb) & CF_NO_ACTIVE)) {
+        return NULL;
+    }
+    /* tcg_debug_assert(!(tb->cflags & CF_INVALID)); */
+
+    /* tb_record(tb); */
+
+    /* add in the hash table */
+    h = tb_hash_func(tb_page_addr0(tb), (tb->cflags & CF_PCREL ? 0 : tb->pc),
+                     tb->flags, tb->cs_base, tb->cflags);
+    qht_remove(&tb_ctx.htable[mtcc_id], tb, h);
+    qatomic_set(&tb->cflags, tb->cflags & ~(CF_NO_ACTIVE | CF_INVALID));
+    h = tb_hash_func(tb_page_addr0(tb), (tb->cflags & CF_PCREL ? 0 : tb->pc),
+                     tb->flags, tb->cs_base, tb->cflags);
+
+    if (qemu_tcg_mtcc_enabled()) {
+        uint32_t mtcc_id = get_mask_from_miscflags(tb,
+                MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT);
+        assert(mtcc_id == curr_mtcc(current_cpu->env_ptr));
+        qht_insert(&tb_ctx.htable[mtcc_id], tb, h, &existing_tb);
+    } else {
+        qht_insert(&tb_ctx.htable[0], tb, h, &existing_tb);
+    }
+
+    /* remove TB from the page(s) if we couldn't insert it */
+    if (unlikely(existing_tb)) {
+        if (((TranslationBlock *)existing_tb)->cflags & CF_INVALID) {
+            fprintf(stderr, "aot_tb_link_page2 existing_tb is CF_INVALID bool flags %x\n",
+                    ((TranslationBlock *)existing_tb)->bool_flags);
+        }
+        tb_remove(tb);
+        return existing_tb;
+    }
+
+    flaged_shadow_htable_insert(tb);
     return tb;
 }
 
@@ -1064,20 +1775,23 @@ bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc)
     addr &= TARGET_PAGE_MASK;
     current_tb_modified = false;
 
-    PAGE_FOR_EACH_TB(addr, last, unused, tb, n) {
-        if (current_tb == tb &&
-            (tb_cflags(current_tb) & CF_COUNT_MASK) != 1) {
-            /*
-             * If we are modifying the current TB, we must stop its
-             * execution. We could be more precise by checking that
-             * the modification is after the current PC, but it would
-             * require a specialized function to partially restore
-             * the CPU state.
-             */
-            current_tb_modified = true;
-            cpu_restore_state_from_tb(current_cpu, current_tb, pc);
+    uint32_t n_mtcc = qemu_tcg_mtcc_enabled()?MTCC_NR:1;
+    for (uint32_t mtcc_id = 0; mtcc_id < n_mtcc; ++mtcc_id) {
+        PAGE_FOR_EACH_TB_MTCC(addr, last, unused, tb, n, mtcc_id) {
+            if (current_tb == tb &&
+                (tb_cflags(current_tb) & CF_COUNT_MASK) != 1) {
+                /*
+                 * If we are modifying the current TB, we must stop its
+                 * execution. We could be more precise by checking that
+                 * the modification is after the current PC, but it would
+                 * require a specialized function to partially restore
+                 * the CPU state.
+                 */
+                current_tb_modified = true;
+                cpu_restore_state_from_tb(current_cpu, current_tb, pc);
+            }
+            tb_phys_invalidate__locked(tb);
         }
-        tb_phys_invalidate__locked(tb);
     }
 
     if (current_tb_modified) {
@@ -1100,6 +1814,10 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
                                       tb_page_addr_t last,
                                       uintptr_t retaddr)
 {
+    p->aot_mesage = PAGE_NO_LOAD;
+    p->aot_tu_file_offset = 0;
+    p->aot_tu_cache_generation = 0;
+
     TranslationBlock *tb;
     PageForEachNext n;
 #ifdef TARGET_HAS_PRECISE_SMC
@@ -1110,11 +1828,41 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
     /* Range may not cross a page. */
     tcg_debug_assert(((start ^ last) & TARGET_PAGE_MASK) == 0);
 
+    uint32_t n_mtcc = qemu_tcg_mtcc_enabled()?MTCC_NR:1;
+    uint32_t mtcc_id = 0;
+
+#ifdef CONFIG_LATX_TU
+    /* Any byte in this physical source page can change the appended CORE. */
+    for (mtcc_id = 0; mtcc_id < n_mtcc; ++mtcc_id) {
+        while (p->native_source_owners[mtcc_id]) {
+            NativeSourceOwner *link = p->native_source_owners[mtcc_id];
+            TranslationBlock *owner = link->owner;
+
+            p->native_source_owners[mtcc_id] = link->next;
+            if (tb_cflags(owner) & CF_INVALID) {
+                continue;
+            }
+#ifdef TARGET_HAS_PRECISE_SMC
+            if (current_tb && tb_is_tu(current_tb) &&
+                tb_tu_identity(current_tb) == tb_tu_identity(owner) &&
+                (tb_cflags(current_tb) & CF_COUNT_MASK) != 1) {
+                /* HAMT native stores recover before retrying as an ordinary
+                 * single-instruction TB. Only ordinary host PCs reach here. */
+                current_tb_modified = true;
+                cpu_restore_state_from_tb(current_cpu, current_tb, retaddr);
+            }
+#endif
+            tb_phys_invalidate__locked(owner);
+        }
+    }
+#endif
+
     /*
      * We remove all the TBs in the range [start, last].
      * XXX: see if in some cases it could be faster to invalidate all the code
      */
-    PAGE_FOR_EACH_TB(start, last, p, tb, n) {
+    for (mtcc_id = 0; mtcc_id < n_mtcc; ++mtcc_id) {
+    PAGE_FOR_EACH_TB_MTCC(start, last, p, tb, n, mtcc_id) {
         tb_page_addr_t tb_start, tb_last;
 
         /* NOTE: this is subtle as a TB may span two physical pages */
@@ -1128,10 +1876,18 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
         }
         if (!(tb_last < start || tb_start > last)) {
 #ifdef TARGET_HAS_PRECISE_SMC
-            if (current_tb == tb &&
+            bool current_tb_invalidated = current_tb == tb;
+#ifdef CONFIG_LATX_TU
+            if (current_tb && tb_is_tu(current_tb) && tb_is_tu(tb) &&
+                (tb->flags & HF_CPL_MASK) &&
+                tb_tu_identity(current_tb) == tb_tu_identity(tb)) {
+                current_tb_invalidated = true;
+            }
+#endif
+            if (current_tb_invalidated &&
                 (tb_cflags(current_tb) & CF_COUNT_MASK) != 1) {
                 /*
-                 * If we are modifying the current TB, we must stop
+                 * If we invalidate the current TB or its TU, we must stop
                  * its execution. We could be more precise by checking
                  * that the modification is after the current PC, but it
                  * would require a specialized function to partially
@@ -1144,9 +1900,22 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
             tb_phys_invalidate__locked(tb);
         }
     }
+    }
 
     /* if no code remaining, no need to continue to use slow writes */
-    if (!p->first_tb) {
+    bool page_is_clean = true;
+    for (mtcc_id = 0; mtcc_id < n_mtcc; ++mtcc_id) {
+        if (p->first_tb[mtcc_id]) {
+            page_is_clean = false;
+        }
+#ifdef CONFIG_LATX_TU
+        native_source_prune(p, mtcc_id);
+        if (p->native_source_owners[mtcc_id]) {
+            page_is_clean = false;
+        }
+#endif
+    }
+    if (page_is_clean) {
         tlb_unprotect_code(start);
     }
 
@@ -1248,6 +2017,33 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
     pages = page_collection_lock(ram_addr, ram_addr + size - 1);
     tb_invalidate_phys_page_fast__locked(pages, ram_addr, size, retaddr);
     page_collection_unlock(pages);
+}
+
+void page_print_tb(uint64_t page)
+{
+    struct PageDesc *p = page_find(page >> 12);
+
+    int mtcc = 0;
+    TranslationBlock *tb = NULL;
+    int n = -1;
+start:
+    tb = (void *)p->first_tb[mtcc];
+    printf("%s:%d MTCC = %d\n", __func__, __LINE__, mtcc);
+    while (tb) {
+        n = (uint64_t)tb & 0x3;
+        tb = (void *)(((uint64_t)tb) & ~0x3UL);
+        printf("n %d TB %lx F %x I %d PhysPC %lx Size %x (%p) ",
+                n, tb->pc, tb->flags, tb->icount,
+                tb->page_addr[0], tb->size,
+                tb);
+        tb = (void *)tb->page_next[n];
+        printf("page_next[%d] = %p\n", n, tb);
+    }
+    if (mtcc == 1) goto out;
+    mtcc = 1;
+    goto start;
+out:
+    return;
 }
 
 #endif /* CONFIG_USER_ONLY */

@@ -29,15 +29,28 @@
 
 #define TCG_HIGHWATER 1024
 
-extern TCGContext tcg_init_ctx;
+extern TCGContext tcg_init_ctx[];
 extern TCGContext **tcg_ctxs;
 extern unsigned int tcg_cur_ctxs;
 extern unsigned int tcg_max_ctxs;
 
+TranslationBlock *region_alloc_tb(TCGContext *s, bool full, bool tu_link);
+#ifdef CONFIG_LATX_TU
+typedef struct TranslationUnitPages TranslationUnitPages;
+TranslationUnitPages *region_alloc_tu_pages(TCGContext *s);
+TranslationBlock **region_alloc_tu_members(TCGContext *s, size_t count);
+#endif
+void region_reset_tb(uint32_t mtcc);
+void print_buffer_size(uint32_t mtcc);
+void *region_alloc_push_pop_data(TranslationBlock *tb, uint32_t mtcc, int ir1_nr);
+void *region_alloc_search(TranslationBlock *tb, uint32_t mtcc);
+void region_reset_search(uint32_t mtcc);
 void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus);
 bool tcg_region_alloc(TCGContext *s);
 void tcg_region_initial_alloc(TCGContext *s);
 void tcg_region_prologue_set(TCGContext *s);
+uint64_t tcg_region_get_offset(const TCGContext *s);
+void tcg_region_rewind_current(TCGContext *s);
 
 static inline void *tcg_call_func(TCGOp *op)
 {

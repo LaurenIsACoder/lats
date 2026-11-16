@@ -22,5 +22,7 @@
  * run until this complete.
  */
 void tb_flush(CPUState *cs);
+void tb_flush_mtcc(CPUState *cs, uint32_t mtcc_id);
+void unlock_all_page(uint32_t mtcc_id);
 
 #endif /* _TB_FLUSH_H_ */

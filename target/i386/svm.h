@@ -134,6 +134,9 @@
 #define SVM_EXIT_MWAIT		0x08b
 #define SVM_EXIT_NPF  		0x400
 
+#define SVM_EXIT_INVPCID        0x0a2
+#define SVM_INTERCEPT_INVPCID   (1U << 2) /* intercept vector at 014h */
+
 #define SVM_EXIT_ERR		-1
 
 #define SVM_CR0_SELECTIVE_MASK (1 << 3 | 1) /* TS and MP */
@@ -155,7 +158,8 @@ struct QEMU_PACKED vmcb_control_area {
 	uint16_t intercept_dr_write;
 	uint32_t intercept_exceptions;
 	uint64_t intercept;
-	uint8_t reserved_1[44];
+	uint32_t intercept3;
+	uint8_t reserved_1[40];
 	uint64_t iopm_base_pa;
 	uint64_t msrpm_base_pa;
 	uint64_t tsc_offset;

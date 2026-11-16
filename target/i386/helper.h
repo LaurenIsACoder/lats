@@ -88,6 +88,7 @@ DEF_HELPER_2(vmload, void, env, int)
 DEF_HELPER_2(vmsave, void, env, int)
 DEF_HELPER_1(stgi, void, env)
 DEF_HELPER_1(clgi, void, env)
+DEF_HELPER_4(invpcid, void, env, tl, i32, i32)
 DEF_HELPER_FLAGS_2(flush_page, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_2(hlt, TCG_CALL_NO_WG, noreturn, env, int)
 DEF_HELPER_FLAGS_2(monitor, TCG_CALL_NO_WG, void, env, tl)
@@ -219,3 +220,10 @@ DEF_HELPER_3(rcrq, tl, env, tl, tl)
 #endif
 
 DEF_HELPER_1(rdrand, tl, env)
+
+DEF_HELPER_2(latx_cmpxchg8b, void, env, tl)
+DEF_HELPER_2(latx_cmpxchg8b_unlocked, void, env, tl)
+#ifdef TARGET_X86_64
+DEF_HELPER_2(latx_cmpxchg16b, void, env, tl)
+DEF_HELPER_2(latx_cmpxchg16b_unlocked, void, env, tl)
+#endif

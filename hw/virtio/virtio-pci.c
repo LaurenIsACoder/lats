@@ -29,10 +29,12 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
 #include "hw/loader.h"
+#include "sysemu/cpus.h"
 #include "sysemu/kvm.h"
 #include "hw/virtio/virtio-pci.h"
 #include "qemu/range.h"
@@ -398,6 +400,10 @@ static void virtio_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     uint16_t vector;
     hwaddr pa;
 
+    if (proxy->guest_reset_pending) {
+        return;
+    }
+
     switch (addr) {
     case VIRTIO_PCI_GUEST_FEATURES:
         /* Guest does not negotiate properly?  We have to assume nothing. */
@@ -758,7 +764,16 @@ static void virtio_write_config(PCIDevice *pci_dev, uint32_t address,
     pci_default_write_config(pci_dev, address, val, len);
 
     if (proxy->flags & VIRTIO_PCI_FLAG_INIT_FLR) {
-        pcie_cap_flr_write_config(pci_dev, address, val, len);
+        uint8_t *devctl = pci_dev->config + pci_dev->exp.exp_cap +
+                          PCI_EXP_DEVCTL;
+
+        if (proxy->guest_reset_pending &&
+            (pci_get_word(devctl) & PCI_EXP_DEVCTL_BCR_FLR)) {
+            proxy->guest_flr_pending = true;
+            pci_word_test_and_clear_mask(devctl, PCI_EXP_DEVCTL_BCR_FLR);
+        } else {
+            pcie_cap_flr_write_config(pci_dev, address, val, len);
+        }
     }
 
     if (proxy->flags & VIRTIO_PCI_FLAG_ATS) {
@@ -1369,7 +1384,9 @@ static void virtio_pci_vmstate_change(DeviceState *d, bool running)
                                      proxy->pci_dev.config[PCI_COMMAND] |
                                      PCI_COMMAND_MASTER, 1);
         }
-        virtio_pci_start_ioeventfd(proxy);
+        if (!proxy->guest_reset_pending) {
+            virtio_pci_start_ioeventfd(proxy);
+        }
     } else {
         virtio_pci_stop_ioeventfd(proxy);
     }
@@ -1433,6 +1450,24 @@ static int virtio_pci_add_mem_cap(VirtIOPCIProxy *proxy,
            cap->cap_len - PCI_CAP_FLAGS);
 
     return offset;
+}
+
+int virtio_pci_add_shm_cap(VirtIOPCIProxy *proxy,
+                           uint8_t bar, uint64_t offset, uint64_t length,
+                           uint8_t id)
+{
+    struct virtio_pci_cap64 cap = {
+        .cap.cap_len = sizeof cap,
+        .cap.cfg_type = VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    };
+
+    cap.cap.bar = bar;
+    cap.cap.length = cpu_to_le32(length);
+    cap.length_hi = cpu_to_le32(length >> 32);
+    cap.cap.offset = cpu_to_le32(offset);
+    cap.offset_hi = cpu_to_le32(offset >> 32);
+    cap.cap.id = id;
+    return virtio_pci_add_mem_cap(proxy, &cap.cap);
 }
 
 static uint64_t virtio_pci_common_read(void *opaque, hwaddr addr,
@@ -1527,6 +1562,52 @@ static uint64_t virtio_pci_common_read(void *opaque, hwaddr addr,
     return val;
 }
 
+static void virtio_pci_cancel_deferred_guest_reset(VirtIOPCIProxy *proxy)
+{
+    VirtIODevice *vdev;
+
+    if (!proxy->guest_reset_pending) {
+        return;
+    }
+
+    vdev = virtio_bus_get_device(&proxy->bus);
+    if (vdev) {
+        vdev->reset_pending = false;
+    }
+    qemu_bh_cancel(proxy->guest_reset_bh);
+    proxy->guest_reset_pending = false;
+    proxy->guest_flr_pending = false;
+}
+
+static void virtio_pci_deferred_guest_reset(void *opaque)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    VirtIODevice *vdev;
+
+    if (!proxy->guest_reset_pending) {
+        return;
+    }
+
+    proxy->guest_reset_pending = false;
+    vdev = virtio_bus_get_device(&proxy->bus);
+    if (vdev) {
+        if (proxy->guest_flr_pending) {
+            uint8_t *devctl = proxy->pci_dev.config +
+                              proxy->pci_dev.exp.exp_cap + PCI_EXP_DEVCTL;
+
+            pci_word_test_and_set_mask(devctl, PCI_EXP_DEVCTL_BCR_FLR);
+            pci_device_reset(&proxy->pci_dev);
+            pci_word_test_and_clear_mask(devctl, PCI_EXP_DEVCTL_BCR_FLR);
+        }
+        if (vdev->reset_pending) {
+            virtio_pci_reset(DEVICE(proxy));
+        }
+        virtio_set_disabled(vdev,
+            !(proxy->pci_dev.config[PCI_COMMAND] & PCI_COMMAND_MASTER));
+    }
+    proxy->guest_flr_pending = false;
+}
+
 static void virtio_pci_common_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned size)
 {
@@ -1535,6 +1616,11 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
     uint16_t vector;
 
     if (vdev == NULL) {
+        return;
+    }
+
+    if (proxy->guest_reset_pending &&
+        addr != VIRTIO_PCI_COMMON_STATUS) {
         return;
     }
 
@@ -1566,8 +1652,29 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
         vdev->config_vector = val;
         break;
     case VIRTIO_PCI_COMMON_STATUS:
+        if (proxy->guest_reset_pending) {
+            break;
+        }
         if (!(val & VIRTIO_CONFIG_S_DRIVER_OK)) {
             virtio_pci_stop_ioeventfd(proxy);
+        }
+
+        if ((val & 0xff) == 0 &&
+            VIRTIO_DEVICE_GET_CLASS(vdev)->defer_modern_guest_reset &&
+            qemu_in_vcpu_thread()) {
+            if (vdev->status == 0) {
+                break;
+            }
+            /* Keep the old status visible until the reset BH completes. */
+            vdev->reset_pending = true;
+            proxy->guest_reset_pending = true;
+            if (!proxy->guest_reset_bh) {
+                proxy->guest_reset_bh = qemu_bh_new_guarded(
+                    virtio_pci_deferred_guest_reset, proxy,
+                    &DEVICE(proxy)->mem_reentrancy_guard);
+            }
+            qemu_bh_schedule(proxy->guest_reset_bh);
+            break;
         }
 
         virtio_set_status(vdev, val & 0xFF);
@@ -1676,7 +1783,8 @@ static void virtio_pci_notify_write(void *opaque, hwaddr addr,
 
     unsigned queue = addr / virtio_pci_queue_mem_mult(proxy);
 
-    if (vdev != NULL && queue < VIRTIO_QUEUE_MAX) {
+    if (!proxy->guest_reset_pending && vdev != NULL &&
+        queue < VIRTIO_QUEUE_MAX) {
         trace_virtio_pci_notify_write(addr, val, size);
         virtio_queue_notify(vdev, queue);
     }
@@ -1690,7 +1798,8 @@ static void virtio_pci_notify_write_pio(void *opaque, hwaddr addr,
 
     unsigned queue = val;
 
-    if (vdev != NULL && queue < VIRTIO_QUEUE_MAX) {
+    if (!proxy->guest_reset_pending && vdev != NULL &&
+        queue < VIRTIO_QUEUE_MAX) {
         trace_virtio_pci_notify_write_pio(addr, val, size);
         virtio_queue_notify(vdev, queue);
     }
@@ -1751,7 +1860,7 @@ static void virtio_pci_device_write(void *opaque, hwaddr addr,
     VirtIOPCIProxy *proxy = opaque;
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
 
-    if (vdev == NULL) {
+    if (vdev == NULL || proxy->guest_reset_pending) {
         return;
     }
 
@@ -2076,6 +2185,7 @@ static void virtio_pci_device_unplugged(DeviceState *d)
     bool modern = virtio_pci_modern(proxy);
     bool modern_pio = proxy->flags & VIRTIO_PCI_FLAG_MODERN_PIO_NOTIFY;
 
+    virtio_pci_cancel_deferred_guest_reset(proxy);
     virtio_pci_stop_ioeventfd(proxy);
 
     if (modern) {
@@ -2194,6 +2304,11 @@ static void virtio_pci_realize(PCIDevice *pci_dev, Error **errp)
             pcie_cap_lnkctl_init(pci_dev);
         }
 
+        if (proxy->flags & VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET) {
+            pci_set_word(pci_dev->config + pos + PCI_PM_CTRL,
+                         PCI_PM_CTRL_NO_SOFT_RESET);
+        }
+
         if (proxy->flags & VIRTIO_PCI_FLAG_INIT_PM) {
             /* Init Power Management Control Register */
             pci_set_word(pci_dev->wmask + pos + PCI_PM_CTRL,
@@ -2216,6 +2331,22 @@ static void virtio_pci_realize(PCIDevice *pci_dev, Error **errp)
          * and pci_config_size() return PCI_CONFIG_SPACE_SIZE.
          */
         pci_dev->cap_present &= ~QEMU_PCI_CAP_EXPRESS;
+
+        if (proxy->flags & VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET) {
+            int pos;
+
+            pos = pci_add_capability(pci_dev, PCI_CAP_ID_PM, 0,
+                                     PCI_PM_SIZEOF, errp);
+            if (pos < 0) {
+                return;
+            }
+            pci_dev->exp.pm_cap = pos;
+            pci_set_word(pci_dev->config + pos + PCI_PM_PMC, 0x3);
+            pci_set_word(pci_dev->config + pos + PCI_PM_CTRL,
+                         PCI_PM_CTRL_NO_SOFT_RESET);
+            pci_set_word(pci_dev->wmask + pos + PCI_PM_CTRL,
+                         PCI_PM_CTRL_STATE_MASK);
+        }
     }
 
     virtio_pci_bus_new(&proxy->bus, sizeof(proxy->bus), proxy);
@@ -2230,6 +2361,7 @@ static void virtio_pci_exit(PCIDevice *pci_dev)
     bool pcie_port = pci_bus_is_express(pci_get_bus(pci_dev)) &&
                      !pci_bus_is_root(pci_get_bus(pci_dev));
 
+    g_clear_pointer(&proxy->guest_reset_bh, qemu_bh_delete);
     msix_uninit_exclusive_bar(pci_dev);
     if (proxy->flags & VIRTIO_PCI_FLAG_AER && pcie_port &&
         pci_is_express(pci_dev)) {
@@ -2243,6 +2375,7 @@ static void virtio_pci_reset(DeviceState *qdev)
     VirtioBusState *bus = VIRTIO_BUS(&proxy->bus);
     int i;
 
+    virtio_pci_cancel_deferred_guest_reset(proxy);
     virtio_bus_reset(bus);
     msix_unuse_all_vectors(&proxy->pci_dev);
 
@@ -2256,18 +2389,42 @@ static void virtio_pci_reset(DeviceState *qdev)
     }
 }
 
+static bool virtio_pci_no_soft_reset(PCIDevice *dev)
+{
+    uint16_t pmcsr;
+
+    if (!dev->exp.pm_cap) {
+        return false;
+    }
+
+    pmcsr = pci_get_word(dev->config + dev->exp.pm_cap + PCI_PM_CTRL);
+    return (pmcsr & PCI_PM_CTRL_NO_SOFT_RESET) &&
+           (pmcsr & PCI_PM_CTRL_STATE_MASK) == 3;
+}
+
 static void virtio_pci_bus_reset_hold(Object *obj)
 {
     PCIDevice *dev = PCI_DEVICE(obj);
     DeviceState *qdev = DEVICE(obj);
+    VirtIOPCIProxy *proxy = VIRTIO_PCI(dev);
+
+    if (virtio_pci_no_soft_reset(dev)) {
+        return;
+    }
 
     virtio_pci_reset(qdev);
 
     if (pci_is_express(dev)) {
         pcie_cap_deverr_reset(dev);
         pcie_cap_lnkctl_reset(dev);
+    }
 
-        pci_set_word(dev->config + dev->exp.pm_cap + PCI_PM_CTRL, 0);
+    if (dev->exp.pm_cap &&
+        (proxy->flags & (VIRTIO_PCI_FLAG_INIT_PM |
+                         VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET))) {
+        pci_word_test_and_clear_mask(
+            dev->config + dev->exp.pm_cap + PCI_PM_CTRL,
+            PCI_PM_CTRL_STATE_MASK);
     }
 }
 
@@ -2294,6 +2451,8 @@ static Property virtio_pci_properties[] = {
                     VIRTIO_PCI_FLAG_INIT_LNKCTL_BIT, true),
     DEFINE_PROP_BIT("x-pcie-pm-init", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_INIT_PM_BIT, true),
+    DEFINE_PROP_BIT("x-pcie-pm-no-soft-reset", VirtIOPCIProxy, flags,
+                    VIRTIO_PCI_FLAG_PM_NO_SOFT_RESET_BIT, true),
     DEFINE_PROP_BIT("x-pcie-flr-init", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_INIT_FLR_BIT, true),
     DEFINE_PROP_BIT("aer", VirtIOPCIProxy, flags,
@@ -2546,4 +2705,3 @@ static void virtio_pci_register_types(void)
 }
 
 type_init(virtio_pci_register_types)
-

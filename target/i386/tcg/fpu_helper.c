@@ -25,6 +25,8 @@
 #include "fpu/softfloat.h"
 #include "fpu/softfloat-macros.h"
 #include "helper-tcg.h"
+#include <fenv.h>
+#include "latx-options.h"
 
 /* float macros */
 #define FT0    (env->ft0)
@@ -55,6 +57,14 @@
 #define FPUS_OE (1 << 3)
 #define FPUS_UE (1 << 4)
 #define FPUS_PE (1 << 5)
+
+#define FPUS_IM (1 << 7)
+#define FPUS_DM (1 << 8)
+#define FPUS_ZM (1 << 9)
+#define FPUS_OM (1 << 10)
+#define FPUS_UM (1 << 11)
+#define FPUS_PM (1 << 12)
+
 #define FPUS_SF (1 << 6)
 #define FPUS_SE (1 << 7)
 #define FPUS_B  (1 << 15)
@@ -486,6 +496,9 @@ void helper_fcomi_ST0_FT0(CPUX86State *env)
     eflags = cpu_cc_compute_all(env, CC_OP);
     eflags = (eflags & ~(CC_Z | CC_P | CC_C)) | fcomi_ccval[ret + 1];
     CC_SRC = eflags;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
     merge_exception_flags(env, old_flags);
 }
 
@@ -499,6 +512,9 @@ void helper_fucomi_ST0_FT0(CPUX86State *env)
     eflags = cpu_cc_compute_all(env, CC_OP);
     eflags = (eflags & ~(CC_Z | CC_P | CC_C)) | fcomi_ccval[ret + 1];
     CC_SRC = eflags;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
     merge_exception_flags(env, old_flags);
 }
 
@@ -1221,6 +1237,7 @@ void helper_f2xm1(CPUX86State *env)
 
 void helper_fptan(CPUX86State *env)
 {
+    if (option_fast_masked_v) fedisableexcept(FE_INVALID);
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -1233,6 +1250,7 @@ void helper_fptan(CPUX86State *env)
         env->fpus &= ~0x400; /* C2 <-- 0 */
         /* the above code is for |arg| < 2**52 only */
     }
+    if (option_fast_masked_v) feenableexcept(FE_INVALID);
 }
 
 /* Values of pi/4, pi/2, 3pi/4 and pi, with 128-bit precision.  */
@@ -2230,6 +2248,7 @@ void helper_fsqrt(CPUX86State *env)
 
 void helper_fsincos(CPUX86State *env)
 {
+    if (option_fast_masked_v) fedisableexcept(FE_INVALID);
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2241,6 +2260,7 @@ void helper_fsincos(CPUX86State *env)
         env->fpus &= ~0x400;  /* C2 <-- 0 */
         /* the above code is for |arg| < 2**63 only */
     }
+    if (option_fast_masked_v) feenableexcept(FE_INVALID);
 }
 
 void helper_frndint(CPUX86State *env)
@@ -2303,6 +2323,7 @@ void helper_fscale(CPUX86State *env)
 
 void helper_fsin(CPUX86State *env)
 {
+    if (option_fast_masked_v) fedisableexcept(FE_INVALID);
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2312,10 +2333,12 @@ void helper_fsin(CPUX86State *env)
         env->fpus &= ~0x400;  /* C2 <-- 0 */
         /* the above code is for |arg| < 2**53 only */
     }
+    if (option_fast_masked_v) feenableexcept(FE_INVALID);
 }
 
 void helper_fcos(CPUX86State *env)
 {
+    if (option_fast_masked_v) fedisableexcept(FE_INVALID);
     double fptemp = floatx80_to_double(env, ST0);
 
     if ((fptemp > MAXTAN) || (fptemp < -MAXTAN)) {
@@ -2325,6 +2348,7 @@ void helper_fcos(CPUX86State *env)
         env->fpus &= ~0x400;  /* C2 <-- 0 */
         /* the above code is for |arg| < 2**63 only */
     }
+    if (option_fast_masked_v) feenableexcept(FE_INVALID);
 }
 
 void helper_fxam_ST0(CPUX86State *env)
@@ -2420,6 +2444,9 @@ static void cpu_set_fpus(CPUX86State *env, uint16_t fpus)
     env->fpstt = (fpus >> 11) & 7;
     env->fpus = fpus & ~0x3800 & ~FPUS_B;
     env->fpus |= env->fpus & FPUS_SE ? FPUS_B : 0;
+    if (env->fpus & (~env->fpuc & FPUC_EM)) {
+        env->fpus |= FPUS_SE | FPUS_B;
+    }
 #if !defined(CONFIG_USER_ONLY)
     if (!(env->fpus & FPUS_SE)) {
         /*
@@ -2534,9 +2561,20 @@ static void do_xsave_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 
 static void do_xsave_mxcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
-    update_mxcsr_from_sse_status(env);
+    if (!qemu_tcg_mode_2_lat()) {
+        update_mxcsr_from_sse_status(env);
+    }
     cpu_stl_data_ra(env, ptr + XO(legacy.mxcsr), env->mxcsr, ra);
     cpu_stl_data_ra(env, ptr + XO(legacy.mxcsr_mask), 0x0000ffff, ra);
+}
+
+static void do_xrstor_mxcsr(CPUX86State *env, uint32_t mxcsr)
+{
+    if (qemu_tcg_mode_2_lat()) {
+        env->mxcsr = mxcsr;
+    } else {
+        cpu_set_mxcsr(env, mxcsr);
+    }
 }
 
 static void do_xsave_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
@@ -2558,20 +2596,23 @@ static void do_xsave_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
     }
 }
 
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
 static void do_xsave_ymmh(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
-    int i, nb_xmm_regs;
-
-    if (env->hflags & HF_CS64_MASK) {
-        nb_xmm_regs = 16;
-    } else {
-        nb_xmm_regs = 8;
-    }
-
-    for (i = 0; i < nb_xmm_regs; i++, ptr += 16) {
-        cpu_stq_data_ra(env, ptr, env->xmm_regs[i].ZMM_Q(2), ra);
-        cpu_stq_data_ra(env, ptr + 8, env->xmm_regs[i].ZMM_Q(3), ra);
-    }
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    int i, nb_xmm_regs;
+//
+//    if (env->hflags & HF_CS64_MASK) {
+//        nb_xmm_regs = 16;
+//    } else {
+//        nb_xmm_regs = 8;
+//    }
+//
+//    for (i = 0; i < nb_xmm_regs; i++, ptr += 16) {
+//        cpu_stq_data_ra(env, ptr, env->xmm_regs[i].ZMM_Q(2), ra);
+//        cpu_stq_data_ra(env, ptr + 8, env->xmm_regs[i].ZMM_Q(3), ra);
+//    }
 }
 
 static void do_xsave_bndregs(CPUX86State *env, target_ulong ptr, uintptr_t ra)
@@ -2719,9 +2760,15 @@ static void do_xrstor_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
     }
 }
 
-static void do_xrstor_mxcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
+static uint32_t load_xrstor_mxcsr(CPUX86State *env, target_ulong ptr,
+                                  uintptr_t ra)
 {
-    cpu_set_mxcsr(env, cpu_ldl_data_ra(env, ptr + XO(legacy.mxcsr), ra));
+    uint32_t mxcsr = cpu_ldl_data_ra(env, ptr + XO(legacy.mxcsr), ra);
+
+    if (mxcsr & 0xffff0000) {
+        raise_exception_ra(env, EXCP0D_GPF, ra);
+    }
+    return mxcsr;
 }
 
 static void do_xrstor_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
@@ -2759,36 +2806,42 @@ static void do_clear_sse(CPUX86State *env)
     }
 }
 
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
 static void do_xrstor_ymmh(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
-    int i, nb_xmm_regs;
-
-    if (env->hflags & HF_CS64_MASK) {
-        nb_xmm_regs = 16;
-    } else {
-        nb_xmm_regs = 8;
-    }
-
-    for (i = 0; i < nb_xmm_regs; i++, ptr += 16) {
-        env->xmm_regs[i].ZMM_Q(2) = cpu_ldq_data_ra(env, ptr, ra);
-        env->xmm_regs[i].ZMM_Q(3) = cpu_ldq_data_ra(env, ptr + 8, ra);
-    }
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    int i, nb_xmm_regs;
+//
+//    if (env->hflags & HF_CS64_MASK) {
+//        nb_xmm_regs = 16;
+//    } else {
+//        nb_xmm_regs = 8;
+//    }
+//
+//    for (i = 0; i < nb_xmm_regs; i++, ptr += 16) {
+//        env->xmm_regs[i].ZMM_Q(2) = cpu_ldq_data_ra(env, ptr, ra);
+//        env->xmm_regs[i].ZMM_Q(3) = cpu_ldq_data_ra(env, ptr + 8, ra);
+//    }
 }
 
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
 static void do_clear_ymmh(CPUX86State *env)
 {
-    int i, nb_xmm_regs;
-
-    if (env->hflags & HF_CS64_MASK) {
-        nb_xmm_regs = 16;
-    } else {
-        nb_xmm_regs = 8;
-    }
-
-    for (i = 0; i < nb_xmm_regs; i++) {
-        env->xmm_regs[i].ZMM_Q(2) = 0;
-        env->xmm_regs[i].ZMM_Q(3) = 0;
-    }
+    fprintf(stderr, "%s:%d lats not support ymm\n", __func__, __LINE__);
+//    int i, nb_xmm_regs;
+//
+//    if (env->hflags & HF_CS64_MASK) {
+//        nb_xmm_regs = 16;
+//    } else {
+//        nb_xmm_regs = 8;
+//    }
+//
+//    for (i = 0; i < nb_xmm_regs; i++) {
+//        env->xmm_regs[i].ZMM_Q(2) = 0;
+//        env->xmm_regs[i].ZMM_Q(3) = 0;
+//    }
 }
 
 static void do_xrstor_bndregs(CPUX86State *env, target_ulong ptr, uintptr_t ra)
@@ -2818,15 +2871,20 @@ static void do_xrstor_pkru(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 
 static void do_fxrstor(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
+    uint32_t mxcsr = 0;
+
     /* The operand must be 16 byte aligned */
     if (ptr & 0xf) {
         raise_exception_ra(env, EXCP0D_GPF, ra);
     }
 
+    if (env->cr[4] & CR4_OSFXSR_MASK) {
+        mxcsr = load_xrstor_mxcsr(env, ptr, ra);
+    }
     do_xrstor_fpu(env, ptr, ra);
 
     if (env->cr[4] & CR4_OSFXSR_MASK) {
-        do_xrstor_mxcsr(env, ptr, ra);
+        do_xrstor_mxcsr(env, mxcsr);
         /* Fast FXRSTOR leaves out the XMM registers */
         if (!(env->efer & MSR_EFER_FFXSR)
             || (env->hflags & HF_CPL_MASK)
@@ -2839,11 +2897,13 @@ static void do_fxrstor(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 void helper_fxrstor(CPUX86State *env, target_ulong ptr)
 {
     do_fxrstor(env, ptr, GETPC());
+    env->old_mxcsr = UINT32_MAX;
 }
 
 static void do_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm, uintptr_t ra)
 {
     uint64_t xstate_bv, xcomp_bv, reserve0;
+    uint32_t mxcsr = 0;
 
     rfbm &= env->xcr0;
 
@@ -2882,6 +2942,10 @@ static void do_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm, uintptr
         raise_exception_ra(env, EXCP0D_GPF, ra);
     }
 
+    if (rfbm & XSTATE_SSE_MASK) {
+        mxcsr = load_xrstor_mxcsr(env, ptr, ra);
+    }
+
     if (rfbm & XSTATE_FP_MASK) {
         if (xstate_bv & XSTATE_FP_MASK) {
             do_xrstor_fpu(env, ptr, ra);
@@ -2893,7 +2957,7 @@ static void do_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm, uintptr
     if (rfbm & XSTATE_SSE_MASK) {
         /* Note that the standard form of XRSTOR loads MXCSR from memory
            whether or not the XSTATE_BV bit is set.  */
-        do_xrstor_mxcsr(env, ptr, ra);
+        do_xrstor_mxcsr(env, mxcsr);
         if (xstate_bv & XSTATE_SSE_MASK) {
             do_xrstor_sse(env, ptr, ra);
         } else {
@@ -2943,6 +3007,7 @@ static void do_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm, uintptr
 void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
 {
     do_xrstor(env, ptr, rfbm, GETPC());
+    env->old_mxcsr = UINT32_MAX;
 }
 
 #if defined(CONFIG_USER_ONLY)
@@ -3058,6 +3123,12 @@ void update_mxcsr_status(CPUX86State *env)
                               (mxcsr & FPUS_PE ? float_flag_inexact : 0),
                               &env->sse_status);
 
+
+    if((~mxcsr) & (FPUS_IM | FPUS_ZM | FPUS_OM | FPUS_UM | FPUS_PM)) {
+        env->hflags |= HF_SIGFPE_ON_MASK;
+    } else {
+        env->hflags &= ~HF_SIGFPE_ON_MASK;
+    }
     /* set denormals are zero */
     set_flush_inputs_to_zero((mxcsr & SSE_DAZ) ? 1 : 0, &env->sse_status);
 

@@ -42,6 +42,7 @@
 GlobalProperty hw_compat_8_0[] = {
     { "migration", "multifd-flush-after-each-section", "on"},
     { TYPE_PCI_DEVICE, "x-pcie-ari-nextfn-1", "on" },
+    { "virtio-gpu-device", "x-scanout-vmstate-version", "1" },
 };
 const size_t hw_compat_8_0_len = G_N_ELEMENTS(hw_compat_8_0);
 
@@ -1305,7 +1306,17 @@ static void validate_cpu_cluster_to_numa_boundary(MachineState *ms)
 MemoryRegion *machine_consume_memdev(MachineState *machine,
                                      HostMemoryBackend *backend)
 {
-    MemoryRegion *ret = host_memory_backend_get_memory(backend);
+    Error *local_err = NULL;
+    MemoryRegion *ret;
+
+    if (!host_memory_backend_prepare(backend, LATX_BACKEND_GUEST_RAM,
+                                     backend->latx_guest_start,
+                                     &local_err)) {
+        error_report_err(local_err);
+        exit(EXIT_FAILURE);
+    }
+    ret = host_memory_backend_get_memory(backend);
+
 
     if (host_memory_backend_is_mapped(backend)) {
         error_report("memory backend %s can't be used multiple times.",
@@ -1339,6 +1350,11 @@ static bool create_default_memdev(MachineState *ms, const char *path, Error **er
                              false, errp)) {
         goto out;
     }
+    if (!host_memory_backend_prepare(MEMORY_BACKEND(obj),
+                                     LATX_BACKEND_GUEST_RAM, 0, errp)) {
+        goto out;
+    }
+
     if (!user_creatable_complete(USER_CREATABLE(obj), errp)) {
         goto out;
     }
@@ -1373,8 +1389,7 @@ void machine_run_board_init(MachineState *machine, const char *mem_path, Error *
         ram_addr_t backend_size = object_property_get_uint(OBJECT(machine->memdev),
                                                            "size",  &error_abort);
         if (backend_size != machine->ram_size) {
-            error_setg(errp, "Machine memory size does not match the size of the memory backend");
-            return;
+	    warn_report("Machine memory size does not match the size of the memory backend");
         }
     } else if (machine_class->default_ram_id && machine->ram_size &&
                numa_uses_legacy_mem()) {

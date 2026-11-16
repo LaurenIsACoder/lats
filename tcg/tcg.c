@@ -58,6 +58,7 @@
 #ifdef CONFIG_USER_ONLY
 #include "exec/user/guest-base.h"
 #endif
+#include "target/i386/latx/include/latx-options.h"
 
 /* Forward declarations for functions declared in tcg-target.c.inc and
    used here. */
@@ -224,18 +225,20 @@ static TCGAtomAlign atom_and_align_for_opc(TCGContext *s, MemOp opc,
                                            MemOp host_atom, bool allow_two_ops)
     __attribute__((unused));
 
-TCGContext tcg_init_ctx;
+TCGContext tcg_init_ctx[MTCC_NR];
 __thread TCGContext *tcg_ctx;
+__thread TCGContext *tcg_ctx_mtcc[MTCC_NR];
 
 TCGContext **tcg_ctxs;
 unsigned int tcg_cur_ctxs;
 unsigned int tcg_max_ctxs;
 TCGv_env cpu_env = 0;
-const void *tcg_code_gen_epilogue;
+const void *tcg_code_gen_epilogue[MTCC_NR];
 uintptr_t tcg_splitwx_diff;
 
 #ifndef CONFIG_TCG_INTERPRETER
-tcg_prologue_fn *tcg_qemu_tb_exec;
+tcg_prologue_fn *tcg_qemu_tb_exec[MTCC_NR];
+tcg_prologue_fn2 *tcg_qemu_tb_exec2[MTCC_NR];
 #endif
 
 static TCGRegSet tcg_target_available_regs[TCG_TYPE_COUNT];
@@ -760,20 +763,25 @@ static void alloc_tcg_plugin_context(TCGContext *s)
 #ifdef CONFIG_USER_ONLY
 void tcg_register_thread(void)
 {
-    tcg_ctx = &tcg_init_ctx;
+    tcg_ctx = tcg_init_ctx;
+    for (unsigned i = 0; i < MTCC_NR; i++) {
+        tcg_ctx_mtcc[i] = &tcg_init_ctx[i];
+    }
 }
 #else
-void tcg_register_thread(void)
+static TCGContext *__thread_alloc_tcg_ctx(uint32_t mtcc_id, unsigned int m)
 {
     TCGContext *s = g_malloc(sizeof(*s));
     unsigned int i, n;
 
-    *s = tcg_init_ctx;
+    *s = tcg_init_ctx[mtcc_id];
+    assert(s->mtcc_id == mtcc_id);
 
     /* Relink mem_base.  */
-    for (i = 0, n = tcg_init_ctx.nb_globals; i < n; ++i) {
-        if (tcg_init_ctx.temps[i].mem_base) {
-            ptrdiff_t b = tcg_init_ctx.temps[i].mem_base - tcg_init_ctx.temps;
+    for (i = 0, n = tcg_init_ctx[mtcc_id].nb_globals; i < n; ++i) {
+        if (tcg_init_ctx[mtcc_id].temps[i].mem_base) {
+            ptrdiff_t b = tcg_init_ctx[mtcc_id].temps[i].mem_base -
+                          tcg_init_ctx[mtcc_id].temps;
             tcg_debug_assert(b >= 0 && b < n);
             s->temps[i].mem_base = &s->temps[b];
         }
@@ -784,12 +792,25 @@ void tcg_register_thread(void)
     g_assert(n < tcg_max_ctxs);
     qatomic_set(&tcg_ctxs[n], s);
 
-    if (n > 0) {
+    if (n > (m-1)) {
         alloc_tcg_plugin_context(s);
         tcg_region_initial_alloc(s);
     }
 
-    tcg_ctx = s;
+    return s;
+}
+void tcg_register_thread(void)
+{
+    TCGContext *s = NULL;
+
+    int n = qemu_tcg_mtcc_enabled() ? MTCC_NR : 1;
+    for (int i = 0; i < n; ++i) {
+        s = __thread_alloc_tcg_ctx(i, n);
+        tcg_ctx_mtcc[i] = s;
+        assert(tcg_ctx_mtcc[i]->mtcc_id == i);
+    }
+
+    tcg_ctx = tcg_ctx_mtcc[0];
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -1280,7 +1301,7 @@ static TCGTemp *tcg_global_reg_new_internal(TCGContext *s, TCGType type,
 
 static void tcg_context_init(unsigned max_cpus)
 {
-    TCGContext *s = &tcg_init_ctx;
+    TCGContext *s = &tcg_init_ctx[0];
     int op, total_args, n, i;
     TCGOpDef *def;
     TCGArgConstraint *args_ct;
@@ -1288,6 +1309,8 @@ static void tcg_context_init(unsigned max_cpus)
 
     memset(s, 0, sizeof(*s));
     s->nb_globals = 0;
+
+    s->mtcc_id = 0;
 
     /* Count total number of arguments and allocate the corresponding
        space */
@@ -1334,7 +1357,16 @@ static void tcg_context_init(unsigned max_cpus)
 
     alloc_tcg_plugin_context(s);
 
+    n = qemu_tcg_mtcc_enabled() ? MTCC_NR : 1;
+    for (int i = 1; i < n; ++i) {
+        tcg_init_ctx[i] = *s;
+        tcg_init_ctx[i].mtcc_id = i;
+        /*alloc_tcg_plugin_context(&tcg_init_ctx[i]);*/
+        tcg_ctx_mtcc[i] = &tcg_init_ctx[i];
+    }
+
     tcg_ctx = s;
+    tcg_ctx_mtcc[0] = s;
     /*
      * In user-mode we simply share the init context among threads, since we
      * use a single region. See the documentation tcg_region_init() for the
@@ -1346,8 +1378,8 @@ static void tcg_context_init(unsigned max_cpus)
     tcg_cur_ctxs = 1;
     tcg_max_ctxs = 1;
 #else
-    tcg_max_ctxs = max_cpus;
-    tcg_ctxs = g_new0(TCGContext *, max_cpus);
+    tcg_max_ctxs = max_cpus * (qemu_tcg_mtcc_enabled()?MTCC_NR:1);
+    tcg_ctxs = g_new0(TCGContext *, max_cpus * (qemu_tcg_mtcc_enabled()?MTCC_NR:1));
 #endif
 
     tcg_debug_assert(!tcg_regset_test_reg(s->reserved_regs, TCG_AREG0));
@@ -1361,19 +1393,58 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_cpus)
     tcg_region_init(tb_size, splitwx, max_cpus);
 }
 
-/*
- * Allocate TBs right before their corresponding translated code, making
- * sure that TBs and code are on different cache lines.
- */
-TranslationBlock *tcg_tb_alloc(TCGContext *s)
+#ifdef CONFIG_LATX_TU
+static struct separated_data s_data[MTCC_NR];
+
+bool tcg_tb_has_private_s_data(const TranslationBlock *tb)
 {
-    uintptr_t align = qemu_icache_linesize;
+    /* Test actual allocation ownership rather than the current option set.
+     * The shared array is translation scratch even if another mode currently
+     * requests persistent side data. TU/full allocations live in the region. */
+    uintptr_t data = (uintptr_t)tb->s_data;
+    return data && (data < (uintptr_t)&s_data[0] ||
+                    data >= (uintptr_t)&s_data[MTCC_NR]);
+}
+
+static bool tcg_tb_needs_private_s_data(bool tu)
+{
+    /*
+     * AOT keeps relocation/push-pop state after translation.  Every fast TU
+     * page-check mode keeps page descriptors and successor check state after
+     * publication. SoftRAS also retains its repair position after translation.
+     * Give those opt-in modes persistent side data; ordinary
+     * TBs can continue to use the shared translation scratch object.
+     */
+    return tu || option_rastoptp || option_sys_aot || tucp_fast_needs_pages_desc() ||
+           (option_pushpop && !option_split_search);
+}
+
+static bool tcg_tb_needs_tu_link_data(void)
+{
+    return tucp_fast_link_check();
+}
+#endif
+
+static TranslationBlock *tcg_tb_alloc_sptb(TCGContext *s, bool tu)
+{
     TranslationBlock *tb;
     void *next;
+#ifdef CONFIG_LATX_TU
+    bool private_s_data = tcg_tb_needs_private_s_data(tu);
+    bool tu_link_data = tcg_tb_needs_tu_link_data();
+#endif
+
+#ifdef CONFIG_LATX_TU
+    tb = region_alloc_tb(s, private_s_data, tu_link_data);
+#else
+    tb = region_alloc_tb(s, tu, false);
+#endif
+    if (!tb) {
+        return NULL;
+    }
 
  retry:
-    tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
-    next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+    next = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, CODE_GEN_ALIGN);
 
     if (unlikely(next > s->code_gen_highwater)) {
         if (tcg_region_alloc(s)) {
@@ -1383,8 +1454,129 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
     }
     qatomic_set(&s->code_gen_ptr, next);
     s->data_gen_ptr = NULL;
+#ifdef CONFIG_LATX_TU
+    if (private_s_data) {
+        tb->s_data = (void *)((uintptr_t)tb + (uintptr_t)sizeof(struct TranslationBlock));
+    } else {
+        tb->s_data = &s_data[s->mtcc_id];
+    }
+    if (tu_link_data) {
+        memset(tb_tu_link_data(tb), 0, sizeof(struct tb_tu_link_data));
+    }
+#endif
+    /* Reused slots may still contain an old auxiliary allocation.  AOT
+     * load does not go through the ordinary translator's TB reset. */
+    tb->search_ptr = NULL;
+#ifndef CONFIG_LATX_TU
+    tb->opt_ptr = NULL;
+#endif
     return tb;
 }
+/*
+ * Allocate TBs right before their corresponding translated code, making
+ * sure that TBs and code are on different cache lines.
+ */
+TranslationBlock *tcg_tb_alloc(TCGContext *s)
+{
+    uintptr_t align = qemu_icache_linesize;
+    TranslationBlock *tb;
+    void *next;
+#ifdef CONFIG_LATX_TU
+    bool private_s_data = tcg_tb_needs_private_s_data(false);
+    bool tu_link_data = tcg_tb_needs_tu_link_data();
+#endif
+
+    if (option_split_tb) {
+        return tcg_tb_alloc_sptb(s, 0);
+    }
+
+ retry:
+    tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
+#ifdef CONFIG_LATX_TU
+    if (private_s_data) {
+        struct separated_data *new_s_data =
+            (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+        if (tu_link_data) {
+            struct tb_tu_link_data *link_data =
+                (void *)(new_s_data + 1);
+            next = (void *)ROUND_UP((uintptr_t)(link_data + 1), align);
+        } else {
+            next = (void *)ROUND_UP((uintptr_t)(new_s_data + 1), align);
+        }
+    } else
+#endif
+    {
+        next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+    }
+
+    if (unlikely(next > s->code_gen_highwater)) {
+        if (tcg_region_alloc(s)) {
+            return NULL;
+        }
+        goto retry;
+    }
+    qatomic_set(&s->code_gen_ptr, next);
+    s->data_gen_ptr = NULL;
+#ifdef CONFIG_LATX_TU
+    if (private_s_data) {
+        tb->s_data = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+    } else {
+        tb->s_data = &s_data[s->mtcc_id];
+    }
+    if (tu_link_data) {
+        memset(tb_tu_link_data(tb), 0, sizeof(struct tb_tu_link_data));
+    }
+#endif
+    tb->search_ptr = NULL;
+#ifndef CONFIG_LATX_TU
+    tb->opt_ptr = NULL;
+#endif
+    return tb;
+}
+
+#ifdef CONFIG_LATX_TU
+TranslationBlock *tcg_tb_alloc_full(TCGContext *s)
+{
+    uintptr_t align = qemu_icache_linesize;
+    TranslationBlock *tb;
+    void *next;
+    bool tu_link_data = tcg_tb_needs_tu_link_data();
+
+    if (option_split_tb) {
+        return tcg_tb_alloc_sptb(s, 1);
+    }
+
+ retry:
+    tb = (void *)ROUND_UP((uintptr_t)s->code_gen_ptr, align);
+    struct separated_data *new_s_data =
+        (void *)ROUND_UP((uintptr_t)(tb + 1), align);
+    if (tu_link_data) {
+        struct tb_tu_link_data *link_data = (void *)(new_s_data + 1);
+        next = (void *)ROUND_UP((uintptr_t)(link_data + 1), align);
+    } else {
+        next = (void *)ROUND_UP((uintptr_t)(new_s_data + 1), align);
+    }
+
+    if (unlikely(next > s->code_gen_highwater)) {
+        if (tcg_region_alloc(s)) {
+            return NULL;
+        }
+        goto retry;
+    }
+    qatomic_set(&s->code_gen_ptr, next);
+    s->data_gen_ptr = NULL;
+    tb->s_data = new_s_data;
+    if (tu_link_data) {
+        memset(tb_tu_link_data(tb), 0, sizeof(struct tb_tu_link_data));
+    }
+    tb->search_ptr = NULL;
+    return tb;
+}
+#endif
+
+#include "target/i386/latx/include/latx-static-codes.h"
+#include "hamt-options.h"
+#include "hamt-dmw.h"
 
 void tcg_prologue_init(TCGContext *s)
 {
@@ -1394,8 +1586,9 @@ void tcg_prologue_init(TCGContext *s)
     s->code_buf = s->code_gen_ptr;
     s->data_gen_ptr = NULL;
 
+    uint32_t mtcc_id = s->mtcc_id;
 #ifndef CONFIG_TCG_INTERPRETER
-    tcg_qemu_tb_exec = (tcg_prologue_fn *)tcg_splitwx_to_rx(s->code_ptr);
+    tcg_qemu_tb_exec[mtcc_id] = (tcg_prologue_fn *)tcg_splitwx_to_rx(s->code_ptr);
 #endif
 
 #ifdef TCG_TARGET_NEED_POOL_LABELS
@@ -1404,7 +1597,22 @@ void tcg_prologue_init(TCGContext *s)
 
     qemu_thread_jit_write();
     /* Generate the prologue.  */
-    tcg_target_qemu_prologue(s);
+    if (qemu_tcg_mode_1_tcg()) {
+        tcg_target_qemu_prologue(s);
+    } else if (qemu_tcg_mode_2_lat()) {
+        tcg_target_2_lat_prologue(s);
+        tcg_qemu_tb_exec2[mtcc_id] = (void *)GET_SC_TABLE(mtcc_id, cs_bt_to_native);
+        if (hamt_enabled() && hamt_mode_dmw()) {
+            tcg_qemu_tb_exec2[mtcc_id] = (void *)DMW_IN(tcg_qemu_tb_exec2[mtcc_id]);
+        }
+#ifdef CONFIG_LATX_PRINT
+        printf("%s tb exec %p mtcc %d\n",
+                __func__, tcg_qemu_tb_exec2[mtcc_id], mtcc_id);
+#endif
+    } else {
+        assert(0);
+    }
+
 
 #ifdef TCG_TARGET_NEED_POOL_LABELS
     /* Allow the prologue to put e.g. guest_base into a pool entry.  */
@@ -1460,7 +1668,7 @@ void tcg_prologue_init(TCGContext *s)
      * For tci, we use NULL as the signal to return from the interpreter,
      * so skip this check.
      */
-    tcg_debug_assert(tcg_code_gen_epilogue != NULL);
+    //tcg_debug_assert(tcg_code_gen_epilogue != NULL);
 #endif
 
     tcg_region_prologue_set(s);

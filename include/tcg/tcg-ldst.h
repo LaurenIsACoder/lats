@@ -34,6 +34,8 @@ tcg_target_ulong helper_ldul_mmu(CPUArchState *env, uint64_t addr,
                                  MemOpIdx oi, uintptr_t retaddr);
 uint64_t helper_ldq_mmu(CPUArchState *env, uint64_t addr,
                         MemOpIdx oi, uintptr_t retaddr);
+void latxs_helper_lddq_mmu(CPUArchState *env, uint64_t addr,
+                           MemOpIdx oi, uintptr_t retaddr);
 Int128 helper_ld16_mmu(CPUArchState *env, uint64_t addr,
                        MemOpIdx oi, uintptr_t retaddr);
 
@@ -57,7 +59,13 @@ void helper_stl_mmu(CPUArchState *env, uint64_t addr, uint32_t val,
                     MemOpIdx oi, uintptr_t retaddr);
 void helper_stq_mmu(CPUArchState *env, uint64_t addr, uint64_t val,
                     MemOpIdx oi, uintptr_t retaddr);
+void latxs_helper_stdq_mmu(CPUArchState *env, uint64_t addr,
+                           uint64_t val, MemOpIdx oi, uintptr_t retaddr);
+void latxs_helper_stdq_mmu_idx(CPUArchState *env, uint64_t addr,
+                           uint64_t val, MemOpIdx oi, uintptr_t retaddr, int idx);
 void helper_st16_mmu(CPUArchState *env, uint64_t addr, Int128 val,
                      MemOpIdx oi, uintptr_t retaddr);
 
+void *helper_mmu(CPUArchState *env, uint64_t addr, MemOpIdx oi, int size, uintptr_t retaddr);
+void *helper_mmu_clear_smc_page(CPUArchState *env, uint64_t addr, MemOpIdx oi, int size, uintptr_t ra);
 #endif /* TCG_LDST_H */

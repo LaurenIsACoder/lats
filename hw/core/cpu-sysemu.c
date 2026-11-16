@@ -69,6 +69,9 @@ hwaddr cpu_get_phys_page_debug(CPUState *cpu, vaddr addr)
 
 int cpu_asidx_from_attrs(CPUState *cpu, MemTxAttrs attrs)
 {
+#ifdef CONFIG_LATX_OPT
+    return !!attrs.secure;
+#else
     int ret = 0;
 
     if (cpu->cc->sysemu_ops->asidx_from_attrs) {
@@ -76,6 +79,7 @@ int cpu_asidx_from_attrs(CPUState *cpu, MemTxAttrs attrs)
         assert(ret < cpu->num_ases && ret >= 0);
     }
     return ret;
+#endif
 }
 
 int cpu_write_elf32_qemunote(WriteCoreDumpFunction f, CPUState *cpu,

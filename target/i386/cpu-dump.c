@@ -502,39 +502,43 @@ void x86_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                 qemu_fprintf(f, " ");
         }
 
+//    TODO support avx.
+//    For now, xmm_regs in CPUX86State is limited to 128 bit.
         if ((env->xcr0 & avx512_mask) == avx512_mask) {
-            /* XSAVE enabled AVX512 */
-            for (i = 0; i < NB_OPMASK_REGS; i++) {
-                qemu_fprintf(f, "Opmask%02d=%016"PRIx64"%s", i,
-                             env->opmask_regs[i], ((i & 3) == 3) ? "\n" : " ");
-            }
-
-            nb = (env->hflags & HF_CS64_MASK) ? 32 : 8;
-            for (i = 0; i < nb; i++) {
-                qemu_fprintf(f, "ZMM%02d=%016"PRIx64" %016"PRIx64" %016"PRIx64
-                             " %016"PRIx64" %016"PRIx64" %016"PRIx64
-                             " %016"PRIx64" %016"PRIx64"\n",
-                             i,
-                             env->xmm_regs[i].ZMM_Q(7),
-                             env->xmm_regs[i].ZMM_Q(6),
-                             env->xmm_regs[i].ZMM_Q(5),
-                             env->xmm_regs[i].ZMM_Q(4),
-                             env->xmm_regs[i].ZMM_Q(3),
-                             env->xmm_regs[i].ZMM_Q(2),
-                             env->xmm_regs[i].ZMM_Q(1),
-                             env->xmm_regs[i].ZMM_Q(0));
-            }
+            qemu_fprintf(f, "avx512 not support by lats");
+//            /* XSAVE enabled AVX512 */
+//            for (i = 0; i < NB_OPMASK_REGS; i++) {
+//                qemu_fprintf(f, "Opmask%02d=%016"PRIx64"%s", i,
+//                             env->opmask_regs[i], ((i & 3) == 3) ? "\n" : " ");
+//            }
+//
+//            nb = (env->hflags & HF_CS64_MASK) ? 32 : 8;
+//            for (i = 0; i < nb; i++) {
+//                qemu_fprintf(f, "ZMM%02d=%016"PRIx64" %016"PRIx64" %016"PRIx64
+//                             " %016"PRIx64" %016"PRIx64" %016"PRIx64
+//                             " %016"PRIx64" %016"PRIx64"\n",
+//                             i,
+//                             env->xmm_regs[i].ZMM_Q(7),
+//                             env->xmm_regs[i].ZMM_Q(6),
+//                             env->xmm_regs[i].ZMM_Q(5),
+//                             env->xmm_regs[i].ZMM_Q(4),
+//                             env->xmm_regs[i].ZMM_Q(3),
+//                             env->xmm_regs[i].ZMM_Q(2),
+//                             env->xmm_regs[i].ZMM_Q(1),
+//                             env->xmm_regs[i].ZMM_Q(0));
+//            }
         } else if ((env->xcr0 & avx_mask)  == avx_mask) {
-            /* XSAVE enabled AVX */
-            nb = env->hflags & HF_CS64_MASK ? 16 : 8;
-            for (i = 0; i < nb; i++) {
-                qemu_fprintf(f, "YMM%02d=%016"PRIx64" %016"PRIx64" %016"PRIx64
-                             " %016"PRIx64"\n", i,
-                             env->xmm_regs[i].ZMM_Q(3),
-                             env->xmm_regs[i].ZMM_Q(2),
-                             env->xmm_regs[i].ZMM_Q(1),
-                             env->xmm_regs[i].ZMM_Q(0));
-            }
+            qemu_fprintf(f, "avx not support by lats");
+//            /* XSAVE enabled AVX */
+//            nb = env->hflags & HF_CS64_MASK ? 16 : 8;
+//            for (i = 0; i < nb; i++) {
+//                qemu_fprintf(f, "YMM%02d=%016"PRIx64" %016"PRIx64" %016"PRIx64
+//                             " %016"PRIx64"\n", i,
+//                             env->xmm_regs[i].ZMM_Q(3),
+//                             env->xmm_regs[i].ZMM_Q(2),
+//                             env->xmm_regs[i].ZMM_Q(1),
+//                             env->xmm_regs[i].ZMM_Q(0));
+//            }
         } else { /* SSE and below cases */
             nb = env->hflags & HF_CS64_MASK ? 16 : 8;
             for (i = 0; i < nb; i++) {

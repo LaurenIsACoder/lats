@@ -463,9 +463,14 @@ struct TypeInfo
  * If an invalid object is passed to this function, a run time assert will be
  * generated.
  */
+#ifdef CONFIG_LATX_OPT
+#define OBJECT_CHECK(type, obj, name) \
+    ((type *)(OBJECT(obj)))
+#else
 #define OBJECT_CHECK(type, obj, name) \
     ((type *)object_dynamic_cast_assert(OBJECT(obj), (name), \
                                         __FILE__, __LINE__, __func__))
+#endif
 
 /**
  * OBJECT_CLASS_CHECK:

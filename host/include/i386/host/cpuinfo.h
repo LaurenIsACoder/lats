@@ -27,6 +27,9 @@
 #define CPUINFO_ATOMIC_VMOVDQA  (1u << 16)
 #define CPUINFO_ATOMIC_VMOVDQU  (1u << 17)
 #define CPUINFO_AES             (1u << 18)
+#define CPUINFO_SCQ             (1u << 19)  /* For LATX compatibility on x86 */
+#define CPUINFO_LAM_BH          (1u << 20)  /* For LATX compatibility on x86 */
+#define CPUINFO_LAMCAS          (1u << 21)  /* For LATX compatibility on x86 */
 
 /* Initialized with a constructor. */
 extern unsigned cpuinfo;

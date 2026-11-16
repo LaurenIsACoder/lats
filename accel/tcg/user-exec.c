@@ -68,7 +68,12 @@ MMUAccessType adjust_signal_pc(uintptr_t *pc, bool is_write)
          * Therefore, adjust to compensate for what will be done later
          * by cpu_restore_state_from_tb.
          */
+#if defined(CONFIG_LATX_OPT) && !defined(CONFIG_LATX_TCG_MODE)
+        /* LAT's search decoder adds GETPC_ADJ, unlike the TCG decoder. */
+        *pc -= GETPC_ADJ;
+#else
         *pc += GETPC_ADJ;
+#endif
         break;
 
     case 1:
@@ -848,6 +853,19 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
     }
     return addr;
 }
+tb_page_addr_t get_page_addr_code_hostp_noexit(CPUArchState *env, vaddr addr,
+                                        void **hostp)
+{
+    int flags;
+
+    flags = probe_access_internal(env, addr, 1, MMU_INST_FETCH, true, 0);
+    if (flags != 0) return -1;
+
+    if (hostp) {
+        *hostp = g2h_untagged(addr);
+    }
+    return addr;
+}
 
 #ifdef TARGET_PAGE_DATA_SIZE
 /*
@@ -1387,7 +1405,7 @@ uint64_t cpu_ldq_code_mmu(CPUArchState *env, abi_ptr addr,
  * Do not allow unaligned operations to proceed.  Return the host address.
  */
 static void *atomic_mmu_lookup(CPUArchState *env, vaddr addr, MemOpIdx oi,
-                               int size, uintptr_t retaddr)
+                               int size, uintptr_t retaddr, void *unused)
 {
     MemOp mop = get_memop(oi);
     int a_bits = get_alignment_bits(mop);

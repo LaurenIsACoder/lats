@@ -181,7 +181,7 @@ static void do_rw(struct thread_info *info)
             bool written = false;
 
             if (qht_lookup(&ht, p, hash) == NULL) {
-                written = qht_insert(&ht, p, hash, NULL);
+                written = qht_insert(&ht, p, hash, NULL, NULL);
             }
             if (written) {
                 stats->in++;
@@ -192,7 +192,7 @@ static void do_rw(struct thread_info *info)
             bool removed = false;
 
             if (qht_lookup(&ht, p, hash)) {
-                removed = qht_remove(&ht, p, hash);
+                removed = qht_remove(&ht, p, hash, NULL);
             }
             if (removed) {
                 stats->rm++;
@@ -357,7 +357,7 @@ static void htable_init(void)
             r = xorshift64star(r);
             p = &keys[r & (init_range - 1)];
             hash = hfunc(*p);
-            if (qht_insert(&ht, p, hash, NULL)) {
+            if (qht_insert(&ht, p, hash, NULL, NULL)) {
                 break;
             }
             retries++;

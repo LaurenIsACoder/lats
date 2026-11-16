@@ -35,6 +35,11 @@
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 
+#include "hamt-options.h"
+#include "hamt-ptw.h"
+#include "latx-hack.h"
+#include "hw/display/vga_int.h"
+
 //#define DEBUG_UNASSIGNED
 
 static unsigned memory_region_transaction_depth;
@@ -743,7 +748,8 @@ static MemoryRegion *memory_region_get_flatview_root(MemoryRegion *mr)
 }
 
 /* Render a memory topology into a list of disjoint absolute ranges. */
-static FlatView *generate_memory_topology(MemoryRegion *mr)
+static FlatView *generate_memory_topology(MemoryRegion *mr,
+                                          int update)
 {
     int i;
     FlatView *view;
@@ -761,6 +767,12 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
     for (i = 0; i < view->nr; i++) {
         MemoryRegionSection mrs =
             section_from_flat_range(&view->ranges[i], view);
+#ifdef CONFIG_LATX_HACK_MEM
+        if (update && !(mrs.mr->ram)) {
+            hamt_ptwdata_set_mmio((uint64_t)mrs.offset_within_address_space,
+                                  (uint64_t)mrs.size);
+        }
+#endif
         flatview_add_to_dispatch(view, &mrs);
     }
     address_space_dispatch_compact(view->dispatch);
@@ -1010,7 +1022,7 @@ static void flatviews_init(void)
     flat_views = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
                                        (GDestroyNotify) flatview_unref);
     if (!empty_view) {
-        empty_view = generate_memory_topology(NULL);
+        empty_view = generate_memory_topology(NULL, 0);
         /* We keep it alive forever in the global variable.  */
         flatview_ref(empty_view);
     } else {
@@ -1022,6 +1034,7 @@ static void flatviews_init(void)
 static void flatviews_reset(void)
 {
     AddressSpace *as;
+    int update = 0;
 
     if (flat_views) {
         g_hash_table_unref(flat_views);
@@ -1037,7 +1050,17 @@ static void flatviews_reset(void)
             continue;
         }
 
-        generate_memory_topology(physmr);
+#ifdef CONFIG_LATX_HACK_MEM
+        if (hamt_enabled() && hamt_use_ptw() &&
+            strncmp(as->name, "memory", 6) == 0)
+        {
+            update = 1;
+        } else {
+            update = 0;
+        }
+#endif
+
+        generate_memory_topology(physmr, update);
     }
 }
 
@@ -1092,7 +1115,7 @@ static void address_space_update_topology(AddressSpace *as)
 
     flatviews_init();
     if (!g_hash_table_lookup(flat_views, physmr)) {
-        generate_memory_topology(physmr);
+        generate_memory_topology(physmr, 0);
     }
     address_space_set_flatview(as);
 }
@@ -1559,6 +1582,29 @@ void memory_region_init_ram_flags_nomigrate(MemoryRegion *mr,
     }
 }
 
+void memory_region_init_ram_flags_nomigrate_from_base(MemoryRegion *mr,
+                                                      Object *owner,
+                                                      const char *name,
+                                                      uint64_t size,
+                                                      uint32_t ram_flags,
+                                                      void *base,
+                                                      Error **errp)
+{
+    Error *err = NULL;
+    memory_region_init(mr, owner, name, size);
+    mr->ram = true;
+    mr->terminates = true;
+    mr->destructor = memory_region_destructor_ram;
+    mr->ram_block = qemu_ram_alloc_from_base(size, ram_flags, mr, base, &err);
+    if (err) {
+        mr->size = int128_zero();
+        object_unparent(OBJECT(mr));
+        error_propagate(errp, err);
+    }
+}
+
+
+
 void memory_region_init_resizeable_ram(MemoryRegion *mr,
                                        Object *owner,
                                        const char *name,
@@ -1611,6 +1657,34 @@ void memory_region_init_ram_from_file(MemoryRegion *mr,
     }
 }
 
+void memory_region_init_ram_from_file_from_base(MemoryRegion *mr,
+                                      Object *owner,
+                                      const char *name,
+                                      uint64_t size,
+                                      uint64_t align,
+                                      uint32_t ram_flags,
+                                      const char *path,
+                                      ram_addr_t offset,
+                                      bool readonly,
+                                      void *base,
+                                      Error **errp)
+{
+    Error *err = NULL;
+    memory_region_init(mr, owner, name, size);
+    mr->ram = true;
+    mr->readonly = readonly;
+    mr->terminates = true;
+    mr->destructor = memory_region_destructor_ram;
+    mr->align = align;
+    mr->ram_block = qemu_ram_alloc_from_file_from_base(size, mr, ram_flags, path,
+                                             offset, readonly, base, &err);
+    if (err) {
+        mr->size = int128_zero();
+        object_unparent(OBJECT(mr));
+        error_propagate(errp, err);
+    }
+}
+
 void memory_region_init_ram_from_fd(MemoryRegion *mr,
                                     Object *owner,
                                     const char *name,
@@ -1627,6 +1701,32 @@ void memory_region_init_ram_from_fd(MemoryRegion *mr,
     mr->destructor = memory_region_destructor_ram;
     mr->ram_block = qemu_ram_alloc_from_fd(size, mr, ram_flags, fd, offset,
                                            false, &err);
+    if (err) {
+        mr->size = int128_zero();
+        object_unparent(OBJECT(mr));
+        error_propagate(errp, err);
+    }
+}
+
+void memory_region_init_ram_from_fd_from_base(MemoryRegion *mr,
+                                              Object *owner,
+                                              const char *name,
+                                              uint64_t size,
+                                              uint32_t ram_flags,
+                                              int fd,
+                                              ram_addr_t offset,
+                                              void *base,
+                                              Error **errp)
+{
+    Error *err = NULL;
+
+    memory_region_init(mr, owner, name, size);
+    mr->ram = true;
+    mr->terminates = true;
+    mr->destructor = memory_region_destructor_ram;
+    mr->ram_block = qemu_ram_alloc_from_fd_from_base(size, mr, ram_flags, fd,
+                                                     offset, false, base,
+                                                     &err);
     if (err) {
         mr->size = int128_zero();
         object_unparent(OBJECT(mr));
@@ -2324,14 +2424,23 @@ DirtyBitmapSnapshot *memory_region_snapshot_and_clear_dirty(MemoryRegion *mr,
     assert(mr->ram_block);
     memory_region_sync_dirty_bitmap(mr, false);
     snapshot = cpu_physical_memory_snapshot_and_clear_dirty(mr, addr, size, client);
-    memory_global_after_dirty_log_sync();
+    /*memory_global_after_dirty_log_sync();*/
     return snapshot;
 }
+
+uint8_t *dirty_bitmap_snapshot_get_dirty(DirtyBitmapSnapshot *snap);
 
 bool memory_region_snapshot_get_dirty(MemoryRegion *mr, DirtyBitmapSnapshot *snap,
                                       hwaddr addr, hwaddr size)
 {
     assert(mr->ram_block);
+#ifdef CONFIG_LATX_HACK_MEM
+    if (strncmp(mr->name, "vga.vram", 8) == 0) {
+        if (hamt_no_vga_dirty()) return true;
+        return hamt_ptwdata_vga_snapshot_is_dirty(addr, size,
+                dirty_bitmap_snapshot_get_dirty(snap));
+    }
+#endif
     return cpu_physical_memory_snapshot_get_dirty(snap,
                 memory_region_get_ram_addr(mr) + addr, size);
 }
@@ -2344,6 +2453,11 @@ void memory_region_set_readonly(MemoryRegion *mr, bool readonly)
         memory_region_update_pending |= mr->enabled;
         memory_region_transaction_commit();
     }
+}
+
+void memory_region_disable_locking(MemoryRegion *mr)
+{
+    qatomic_set(&mr->disable_locking, true);
 }
 
 void memory_region_set_nonvolatile(MemoryRegion *mr, bool nonvolatile)
@@ -2610,6 +2724,11 @@ done:
     memory_region_transaction_commit();
 }
 
+uint64_t vram_base;
+uint64_t vram_size;
+uint64_t vram_count;
+extern VGACommonState *system_vga;
+extern void cpu_arch_state_set_vram(CPUArchState *env, uint64_t b, uint64_t s);
 static void memory_region_add_subregion_common(MemoryRegion *mr,
                                                hwaddr offset,
                                                MemoryRegion *subregion)
@@ -2622,6 +2741,23 @@ static void memory_region_add_subregion_common(MemoryRegion *mr,
         alias->mapped_via_alias++;
     }
     subregion->addr = offset;
+#ifdef CONFIG_LATX_HACK_MEM
+    if (strncmp(subregion->name, "vga.vram", 8) == 0 &&
+        (uint64_t)offset < latx_memory_backend_size) {
+        vram_base = offset;
+        vram_size = subregion->size;
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            cpu_arch_state_set_vram(cpu->env_ptr, vram_base, vram_size);
+        }
+        if (subregion->ram_block->host != (void *)(HACK_RAMBASE + offset)) {
+            memcpy((void *)HACK_RAMBASE + offset,
+                    subregion->ram_block->host, subregion->size);
+        }
+        subregion->ram_block->host = (void *) HACK_RAMBASE + offset;
+        system_vga->vram_ptr = memory_region_get_ram_ptr(subregion);
+    }
+#endif
     memory_region_update_container_subregions(subregion);
 }
 
@@ -3514,10 +3650,26 @@ static void mtree_info_as(bool dispatch_tree, bool owner, bool disabled)
     }
 }
 
-void mtree_info(bool flatview, bool dispatch_tree, bool owner, bool disabled)
+static void mtree_info_ramblock(bool ramblock)
+{
+    RAMBlock *rb;
+    RAMBLOCK_FOREACH(rb) {
+        qemu_printf("RamBlock HOST 0x%010lx RAMoffset 0x%010lx Length 0x%010lx 0x%010lx MR.addr 0x%010lx : %s\n",
+                (uint64_t)rb->host,
+                rb->offset,
+                rb->used_length,
+                rb->max_length,
+                rb->mr->addr,
+                rb->mr->name);
+    }
+}
+
+void mtree_info(bool flatview, bool dispatch_tree, bool owner, bool disabled, bool ramblock)
 {
     if (flatview) {
         mtree_info_flatview(dispatch_tree, owner);
+    } else if (ramblock) {
+        mtree_info_ramblock(ramblock);
     } else {
         mtree_info_as(dispatch_tree, owner, disabled);
     }

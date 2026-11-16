@@ -829,12 +829,24 @@ static inline int64_t get_clock(void)
 
 extern int use_rt_clock;
 
+static uint64_t latx_host_rdtime(void)
+{
+    uint64_t rd = 0, rj = 0;
+    __asm__ __volatile__ (
+            "rdtime.d %0, %1\r\n"
+            : "+r"(rd), "+r"(rj)
+            : "r"(rd), "r"(rj)
+            :);
+    return rd;
+}
+
 static inline int64_t get_clock(void)
 {
     if (use_rt_clock) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        return latx_host_rdtime() * 10;
+//        struct timespec ts;
+//        clock_gettime(CLOCK_MONOTONIC, &ts);
+//        return ts.tv_sec * 1000000000LL + ts.tv_nsec;
     } else {
         /* XXX: using gettimeofday leads to problems if the date
            changes, so it should be avoided. */
@@ -978,7 +990,20 @@ static inline int64_t cpu_get_host_ticks(void)
     ofs = cc >> 32;
     return cur - ofs;
 }
+#elif defined(__loongarch__)
 
+static inline int64_t cpu_get_host_ticks(void)
+{
+    uint32_t rID = 0;
+    uint64_t val = 0;
+
+    __asm__ __volatile__(
+        "rdtime.d %0, %1 \n\t"
+        : "=r"(val), "=r"(rID)
+        :
+        );
+    return val;
+}
 #else
 /* The host CPU doesn't have an easily accessible cycle counter.
    Just return a monotonically increasing value.  This will be

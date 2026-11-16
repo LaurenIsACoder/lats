@@ -666,3 +666,23 @@ void hmp_info_local_apic(Monitor *mon, const QDict *qdict)
     }
     x86_cpu_dump_local_apic_state(cs, CPU_DUMP_FPU);
 }
+
+void hmp_info_latx_irq(Monitor *mon, const QDict *qdict)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        X86CPU *xcpu = X86_CPU(cs);
+        CPUX86State *env = &xcpu->env;
+        monitor_printf(mon,
+            "cpu%d: int_req=0x%x exit_req=%d halted=%d icount_decr.u32=0x%x "
+            "eflags=0x%x hflags=0x%x hflags2=0x%x exception=%d\n",
+            cs->cpu_index,
+            qatomic_read(&cs->interrupt_request),
+            qatomic_read(&cs->exit_request),
+            cs->halted,
+            qatomic_read(&xcpu->neg.icount_decr.u32),
+            (uint32_t)env->eflags, env->hflags, env->hflags2,
+            cs->exception_index);
+    }
+}

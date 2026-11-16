@@ -37,6 +37,11 @@
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
 
+#include "latx/include/latx-sigfpe-sys.h"
+#include "latx/include/latx-ras.h"
+#include "latx/include/latx-config.h"
+#include "hamt-enter.h"
+
 /* Kick all RR vCPUs */
 void rr_kick_vcpu_thread(CPUState *unused)
 {
@@ -111,7 +116,7 @@ static void rr_wait_io_event(void)
 
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();
-        qemu_cond_wait_iothread(first_cpu->halt_cond);
+        qemu_cond_wait_2_iothread(first_cpu->halt_cond);
     }
 
     rr_start_kick_timer();
@@ -169,6 +174,8 @@ static int rr_cpu_count(void)
     return cpu_count;
 }
 
+#include "target/i386/latx/include/latx-sys-env-init-func.h"
+
 /*
  * In the single-threaded case each vCPU is simulated in turn. If
  * there is more than a single vCPU we create a simple timer to kick
@@ -196,9 +203,12 @@ static void *rr_cpu_thread_fn(void *arg)
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
+    latxs_init_rr_thread_sigfpe(cpu);
+    /*latxs_init_rr_thread_sigsegv(cpu);*/
+
     /* wait for initial kick-off after machine start */
     while (first_cpu->stopped) {
-        qemu_cond_wait_iothread(first_cpu->halt_cond);
+        qemu_cond_wait_2_iothread(first_cpu->halt_cond);
 
         /* process any pending work */
         CPU_FOREACH(cpu) {
@@ -213,6 +223,12 @@ static void *rr_cpu_thread_fn(void *arg)
 
     /* process any pending work */
     cpu->exit_request = 1;
+
+    if (qemu_tcg_mode_2_lat()) {
+        latx_lsenv_init(cpu->env_ptr);
+    }
+
+    cpu_enter_hamt(cpu, HAMT_MODE_RR, cpu->cpu_index);
 
     while (1) {
         /* Only used for icount_enabled() */
@@ -243,6 +259,9 @@ static void *rr_cpu_thread_fn(void *arg)
         }
 
         while (cpu && cpu_work_list_empty(cpu) && !cpu->exit_request) {
+            if (qemu_tcg_mode_2_lat()) {
+                latxs_lsenv_switch(cpu->env_ptr);
+            }
             /* Store rr_current_cpu before evaluating cpu_can_run().  */
             qatomic_set_mb(&rr_current_cpu, cpu);
 

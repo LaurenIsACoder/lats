@@ -68,6 +68,8 @@
 enum QSPType {
     QSP_MUTEX,
     QSP_BQL_MUTEX,
+    QSP_MMIO_BQL_READ,
+    QSP_MMIO_BQL_WRITE,
     QSP_REC_MUTEX,
     QSP_CONDVAR,
 };
@@ -120,11 +122,22 @@ static bool qsp_initialized, qsp_initializing;
 static const char * const qsp_typenames[] = {
     [QSP_MUTEX]     = "mutex",
     [QSP_BQL_MUTEX] = "BQL mutex",
+    [QSP_MMIO_BQL_READ] = "MMIO read",
+    [QSP_MMIO_BQL_WRITE] = "MMIO write",
     [QSP_REC_MUTEX] = "rec_mutex",
     [QSP_CONDVAR]   = "condvar",
 };
 
-QemuMutexLockFunc qemu_bql_mutex_lock_func = qemu_mutex_lock_impl;
+void qemu_bql_lock_impl(QemuMutex *mutex, const char *file, int line)
+{
+#ifdef CONFIG_LATX_OPT_BQL
+    pthread_spin_lock(&mutex->spin);
+#else
+    qemu_mutex_lock_impl(mutex, file, line);
+#endif
+}
+
+QemuMutexLockFunc qemu_bql_mutex_lock_func = qemu_bql_lock_impl;
 QemuMutexLockFunc qemu_mutex_lock_func = qemu_mutex_lock_impl;
 QemuMutexTrylockFunc qemu_mutex_trylock_func = qemu_mutex_trylock_impl;
 QemuRecMutexLockFunc qemu_rec_mutex_lock_func = qemu_rec_mutex_lock_impl;
@@ -357,6 +370,18 @@ static inline void qsp_entry_record(QSPEntry *e, int64_t delta)
     do_qsp_entry_record(e, delta, true);
 }
 
+void qsp_record_mmio_bql(const void *mr, const char *name, uint64_t offset,
+                         bool is_write, int64_t wait_ns)
+{
+    enum QSPType type = is_write ? QSP_MMIO_BQL_WRITE : QSP_MMIO_BQL_READ;
+    uint64_t bucket = offset >> 8;
+    QSPEntry *entry;
+
+    entry = qsp_entry_get(mr, name,
+                          (int)MIN(bucket, (uint64_t)INT_MAX), type);
+    qsp_entry_record(entry, wait_ns);
+}
+
 #define QSP_GEN_VOID(type_, qsp_t_, func_, impl_)                       \
     static void func_(type_ *obj, const char *file, int line)           \
     {                                                                   \
@@ -387,7 +412,7 @@ static inline void qsp_entry_record(QSPEntry *e, int64_t delta)
         return err;                                                     \
     }
 
-QSP_GEN_VOID(QemuMutex, QSP_BQL_MUTEX, qsp_bql_mutex_lock, qemu_mutex_lock_impl)
+QSP_GEN_VOID(QemuMutex, QSP_BQL_MUTEX, qsp_bql_mutex_lock, qemu_bql_lock_impl)
 QSP_GEN_VOID(QemuMutex, QSP_MUTEX, qsp_mutex_lock, qemu_mutex_lock_impl)
 QSP_GEN_RET1(QemuMutex, QSP_MUTEX, qsp_mutex_trylock, qemu_mutex_trylock_impl)
 
@@ -450,7 +475,7 @@ void qsp_disable(void)
 {
     qatomic_set(&qemu_mutex_lock_func, qemu_mutex_lock_impl);
     qatomic_set(&qemu_mutex_trylock_func, qemu_mutex_trylock_impl);
-    qatomic_set(&qemu_bql_mutex_lock_func, qemu_mutex_lock_impl);
+    qatomic_set(&qemu_bql_mutex_lock_func, qemu_bql_lock_impl);
     qatomic_set(&qemu_rec_mutex_lock_func, qemu_rec_mutex_lock_impl);
     qatomic_set(&qemu_rec_mutex_trylock_func, qemu_rec_mutex_trylock_impl);
     qatomic_set(&qemu_cond_wait_func, qemu_cond_wait_impl);
@@ -647,6 +672,13 @@ static char *qsp_at(const QSPCallSite *callsite)
 {
     GString *s = g_string_new(NULL);
     const char *shortened;
+
+    if (callsite->type == QSP_MMIO_BQL_READ ||
+        callsite->type == QSP_MMIO_BQL_WRITE) {
+        g_string_append_printf(s, "%s+0x%" PRIx64, callsite->file,
+                               (uint64_t)(unsigned int)callsite->line << 8);
+        return g_string_free(s, FALSE);
+    }
 
     /* remove the absolute path to qemu */
     if (unlikely(strlen(callsite->file) < qsp_qemu_path_len)) {

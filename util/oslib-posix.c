@@ -204,6 +204,54 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *alignment, bool shared,
     return ptr;
 }
 
+void *qemu_anon_ram_alloc_from_base(size_t size, void *base,
+        uint64_t *alignment, bool shared, bool noreserve)
+{
+    /* int mmap_flags = MAP_ANONYMOUS | MAP_FIXED | MAP_SHARED ; */
+    int mmap_flags = MAP_ANONYMOUS | MAP_FIXED | MAP_PRIVATE;
+#ifdef CONFIG_LATX_PRINT
+    printf("%s base %p size %lx\n", __func__, base, size);
+#endif
+
+    void *ptr = NULL;
+    // hugetlb should be 32MB aligned
+    if (((uint64_t)base & 0x1ffffff) == 0ULL) {
+        ptr = mmap(base, size, PROT_READ | PROT_WRITE,
+                   mmap_flags | MAP_HUGETLB, -1, 0);
+        if (ptr == base) {
+#ifdef CONFIG_LATX_PRINT
+            printf("%s ptr %p with huge tlb\n", __func__, ptr);
+#endif
+            goto alloc_finish;
+        } else {
+#ifdef CONFIG_LATX_PRINT
+            printf("%s ptr %p fail to use huge tlb\n", __func__, ptr);
+#endif
+        }
+    }
+
+    ptr = mmap(base, size, PROT_READ | PROT_WRITE, mmap_flags, -1, 0);
+    if (ptr == base) {
+#ifdef CONFIG_LATX_PRINT
+        printf("%s ptr %p without huge tlb\n", __func__, ptr);
+#endif
+    } else {
+#ifdef CONFIG_LATX_PRINT
+        printf("%s ptr %p fail to alloc\n", __func__, ptr);
+#endif
+        return NULL;
+    }
+
+    qemu_madvise(base, size, QEMU_MADV_HUGEPAGE);
+#ifdef CONFIG_LATX_PRINT
+        printf("%s ptr %p madvise to use huge tlb\n", __func__, ptr);
+#endif
+
+alloc_finish:
+    trace_qemu_anon_ram_alloc(size, ptr);
+    return ptr;
+}
+
 void qemu_anon_ram_free(void *ptr, size_t size)
 {
     trace_qemu_anon_ram_free(ptr, size);
@@ -224,6 +272,7 @@ void qemu_socket_set_nonblock(int fd)
 {
     int f;
     f = qemu_socket_try_set_nonblock(fd);
+    (void )f;
     assert(f == 0);
 }
 

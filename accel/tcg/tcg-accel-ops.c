@@ -40,6 +40,7 @@
 #include "tcg-accel-ops-mttcg.h"
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
+#include "latx-sigrt-sys.h"
 
 /* common functionality among all TCG variants */
 
@@ -72,6 +73,7 @@ int tcg_cpus_exec(CPUState *cpu)
     int ret;
     assert(tcg_enabled());
     cpu_exec_start(cpu);
+    offline_cpu = cpu;
     ret = cpu_exec(cpu);
     cpu_exec_end(cpu);
     return ret;
@@ -91,7 +93,7 @@ void tcg_handle_interrupt(CPUState *cpu, int mask)
     if (!qemu_cpu_is_self(cpu)) {
         qemu_cpu_kick(cpu);
     } else {
-        qatomic_set(&cpu_neg(cpu)->icount_decr.u16.high, -1);
+        lats_request_tb_exit(cpu);
     }
 }
 

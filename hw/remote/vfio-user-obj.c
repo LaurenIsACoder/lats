@@ -381,9 +381,10 @@ static int vfu_object_mr_rw(MemoryRegion *mr, uint8_t *buf, hwaddr offset,
          * The read/write logic used below is similar to the ones in
          * flatview_read/write_continue()
          */
-        release_lock = prepare_mmio_access(mr);
-
         access_size = memory_access_size(mr, size, offset);
+        release_lock = prepare_mmio_access(mr, offset, access_size,
+                                           is_write,
+                                           MEMTXATTRS_UNSPECIFIED);
 
         if (is_write) {
             val = ldn_he_p(ptr, access_size);

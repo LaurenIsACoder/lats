@@ -184,9 +184,9 @@ cpu=""
 cross_compile="no"
 cross_prefix=""
 host_cc="cc"
-EXTRA_CFLAGS=""
-EXTRA_CXXFLAGS=""
-EXTRA_OBJCFLAGS=""
+EXTRA_CFLAGS="-mlsx -fno-tree-vectorize"
+EXTRA_CXXFLAGS="-mlsx"
+EXTRA_OBJCFLAGS="-mlsx"
 EXTRA_LDFLAGS=""
 
 # Default value for a variable defining feature "foo".
@@ -245,10 +245,29 @@ for opt do
   esac
 done
 
-
 git_submodules_action="update"
 git="git"
 debug_tcg="no"
+latx_tcg_mode="no"
+latx_profiler="no"
+latx_opt="no"
+latx_opt_tu="no"
+latx_opt_nofp="no"
+latx_opt_eflags="no"
+latx_opt_bql="no"
+latx_opt_mmio_lockless="no"
+latx_ndebug="no"
+latx_debug="no"
+latx_debug_aot="no"
+latx_hack_mem="no"
+latx_print="no"
+latx_tb_exec_trace="no"
+capstone_diet="yes"
+pcrel="no"
+atomic="no"
+victim_tlb="no"
+region_tree_enable="no"
+latx_rr="no"
 docs="auto"
 EXESUF=""
 prefix="/usr/local"
@@ -412,6 +431,7 @@ haiku)
 ;;
 linux)
   linux="yes"
+  pie="no"
 ;;
 esac
 
@@ -665,6 +685,39 @@ meson_option_parse() {
   fi
 }
 
+# test for new world by checking the header of ELF file
+# 0x43 is ABI 2.0, which is the new world; 0x03 is ABI 1.0, which is the old world
+latx_new_world="no"
+if ! do_cc -o "$TMPE" "$TMPC"; then
+    echo $TMPE
+    error_exit "\"$cc\" cannot build an executable (is your linker broken?)"
+fi
+
+if [ ! -x "$TMPE" ]; then
+    error_exit "Detection file is not an executable"
+fi
+
+if ! command -v readelf >/dev/null 2>&1; then
+    error_exit "Error: readelf is not installed"
+fi
+
+if [ "$(LC_ALL=C readelf -h "$TMPE" \
+    | grep Flags \
+    | awk -F' ' '{print $2}' \
+    | awk -F',' '{print $1}')" = "0x43" ]; then
+    latx_new_world="yes"
+else
+    latx_new_world="no"
+fi
+
+if test "$latx_new_world" = "yes" ; then
+    latx_ldflags="-T$source_path/latx-x86_64-new.lds"
+else
+    latx_ldflags="-T$source_path/latx-x86_64.lds"
+fi
+
+EXTRA_LDFLAGS="$latx_ldflags $EXTRA_LDFLAGS"
+
 for opt do
   optarg=$(expr "x$opt" : 'x[^=]*=\(.*\)')
   case "$opt" in
@@ -761,6 +814,65 @@ for opt do
   --enable-debug-tcg) debug_tcg="yes"
   ;;
   --disable-debug-tcg) debug_tcg="no"
+  ;;
+  --enable-latx-profiler) latx_profiler="yes"
+                          region_tree_enable="yes"
+                          capstone_diet="no"
+  ;;
+  --enable-latx-tcg-mode) latx_tcg_mode="yes"
+  ;;
+  --disable-latx-tcg-mode) latx_tcg_mode="no"
+  ;;
+  --enable-latx-ndebug) latx_ndebug="yes"
+  ;;
+  --disable-latx-ndebug) latx_ndebug="no"
+  ;;
+  --enable-latx-debug) latx_debug="yes"
+                       latx_debug_aot="yes"
+  ;;
+  --disable-latx-debug) latx_debug="no"
+                        latx_debug_aot="no"
+  ;;
+  --enable-latx-debug-aot) latx_debug_aot="yes"
+  ;;
+  --disable-latx-debug-aot) latx_debug_aot="no"
+  ;;
+  --enable-latx-opt) latx_opt="yes"
+  ;;
+  --enable-latx-opt-tu) latx_opt_tu="yes"
+  ;;
+  --enable-latx-opt-nofp) latx_opt_nofp="yes"
+  ;;
+  --enable-latx-opt-bql) latx_opt_bql="yes"
+  ;;
+  --enable-latx-opt-mmio-lockless) latx_opt_mmio_lockless="yes"
+  ;;
+  --enable-latx-opt-eflags) latx_opt_eflags="yes"
+  ;;
+  --enable-latx-hack-mem) latx_hack_mem="yes"
+  ;;
+  --enable-latx-print) latx_print="yes"
+  ;;
+  --enable-latx-tb-exec-trace) latx_tb_exec_trace="yes"
+  ;;
+  --enable-capstone-diet) capstone_diet="yes"
+  ;;
+  --disable-capstone-diet) capstone_diet="no"
+  ;;
+  --enable-pcrel) pcrel="yes"
+  ;;
+  --enable-atomic) atomic="yes"
+  ;;
+  --enable-victim-tlb) victim_tlb="yes"
+  ;;
+  --disable-victim-tlb) victim_tlb="no"
+  ;;
+  --enable-tcg-region-tree) region_tree_enable="yes"
+  ;;
+  --disable-tcg-region-tree) region_tree_enable="no"
+  ;;
+  --enable-latx-rr) latx_rr="yes"
+                    latx_opt="no"
   ;;
   --enable-debug)
       # Enable debugging options that aren't excessively noisy
@@ -1721,6 +1833,75 @@ echo all: >> $config_host_mak
 
 if test "$debug_tcg" = "yes" ; then
   echo "CONFIG_DEBUG_TCG=y" >> $config_host_mak
+fi
+if test "$latx_tcg_mode" = "yes" ; then
+  echo "CONFIG_LATX_TCG_MODE=y" >> $config_host_mak
+  region_tree_enable="yes"
+  latx_opt_eflags="no"
+fi
+if test "$latx_rr" = "yes" ; then
+  echo "CONFIG_LATX_RR=y" >> $config_host_mak
+  latx_opt="no"
+fi
+if test "$latx_profiler" = "yes" ; then
+  echo "CONFIG_LATX_PROFILER=y" >> $config_host_mak
+fi
+if test "$latx_opt" = "yes" ; then
+  echo "CONFIG_LATX_OPT=y" >> $config_host_mak
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -fno-stack-protector"
+fi
+if test "$latx_ndebug" = "yes" ; then
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -DNDEBUG"
+fi
+if test "$latx_debug" = "yes" ; then
+  echo "CONFIG_LATX_DEBUG=y" >> $config_host_mak
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -g -rdynamic"
+fi
+if test "$latx_debug_aot" = "yes" ; then
+  echo "CONFIG_LATX_DEBUG_AOT=y" >> $config_host_mak
+fi
+if test "$latx_opt_bql" = "yes" ; then
+  echo "CONFIG_LATX_OPT_BQL=y" >> $config_host_mak
+fi
+if test "$latx_opt_mmio_lockless" = "yes" ; then
+  echo "CONFIG_LATX_OPT_MMIO_LOCKLESS=y" >> $config_host_mak
+fi
+if test "$latx_opt_nofp" = "yes" ; then
+  echo "CONFIG_LATX_OPT_NOFP=y" >> $config_host_mak
+fi
+if test "$latx_opt_tu" = "yes" ; then
+  echo "CONFIG_LATX_TU=y" >> $config_host_mak
+fi
+if test "$latx_opt_tu" = "yes" ; then
+  echo "CONFIG_LATX_CAPSTONE_OP_ACCESS=y" >> $config_host_mak
+fi
+if test "$latx_opt_eflags" = "yes" ; then
+  echo "CONFIG_LATX_OPT_EFLAGS=y" >> $config_host_mak
+fi
+if test "$latx_hack_mem" = "yes" ; then
+  echo "CONFIG_LATX_HACK_MEM=y" >> $config_host_mak
+fi
+if test "$latx_tb_exec_trace" = "yes" ; then
+  echo "CONFIG_LATX_TB_EXEC_TRACE=y" >> $config_host_mak
+fi
+if test "$latx_print" = "yes" ; then
+  echo "CONFIG_LATX_PRINT=y" >> $config_host_mak
+  capstone_diet="no"
+fi
+if test "$capstone_diet" = "yes" ; then
+  echo "CONFIG_CAPSTONE_DIET=y" >> $config_host_mak
+fi
+if test "$pcrel" = "yes" ; then
+  echo "CONFIG_PCREL=y" >> $config_host_mak
+fi
+if test "$atomic" = "yes" ; then
+  echo "CONFIG_ATOMIC=y" >> $config_host_mak
+fi
+if test "$victim_tlb" = "yes" ; then
+  echo "CONFIG_VICTIM_TLB=y" >> $config_host_mak
+fi
+if test "$region_tree_enable" = "yes" ; then
+  echo "CONFIG_TCG_REGION_TREE_ENABLE=y" >> $config_host_mak
 fi
 if test "$mingw32" = "yes" ; then
   echo "CONFIG_WIN32=y" >> $config_host_mak

@@ -65,6 +65,12 @@
  */
 #define VIRTIO_GPU_F_CONTEXT_INIT        4
 
+/*
+ * Project extension: explicitly transfer ownership of a fixed-mapped
+ * HOST3D dma-buf between guest CPU access and the host renderer.
+ */
+#define VIRTIO_GPU_F_RESOURCE_SYNC_BLOB  5
+
 enum virtio_gpu_ctrl_type {
 	VIRTIO_GPU_UNDEFINED = 0,
 
@@ -95,6 +101,7 @@ enum virtio_gpu_ctrl_type {
 	VIRTIO_GPU_CMD_SUBMIT_3D,
 	VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
 	VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
+	VIRTIO_GPU_CMD_RESOURCE_SYNC_BLOB,
 
 	/* cursor commands */
 	VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
@@ -309,6 +316,7 @@ struct virtio_gpu_cmd_submit {
 
 #define VIRTIO_GPU_CAPSET_VIRGL 1
 #define VIRTIO_GPU_CAPSET_VIRGL2 2
+#define VIRTIO_GPU_CAPSET_VENUS 4
 
 /* VIRTIO_GPU_CMD_GET_CAPSET_INFO */
 struct virtio_gpu_get_capset_info {
@@ -451,6 +459,15 @@ struct virtio_gpu_resource_unmap_blob {
 	struct virtio_gpu_ctrl_hdr hdr;
 	uint32_t resource_id;
 	uint32_t padding;
+};
+
+#define VIRTIO_GPU_RESOURCE_SYNC_BLOB_CPU_START (1 << 0)
+#define VIRTIO_GPU_RESOURCE_SYNC_BLOB_CPU_END   (1 << 1)
+
+struct virtio_gpu_resource_sync_blob {
+	struct virtio_gpu_ctrl_hdr hdr;
+	uint32_t resource_id;
+	uint32_t flags;
 };
 
 #endif

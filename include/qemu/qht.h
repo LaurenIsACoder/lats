@@ -67,6 +67,8 @@ void qht_init(struct qht *ht, qht_cmp_func_t cmp, size_t n_elems,
  */
 void qht_destroy(struct qht *ht);
 
+size_t qht_n_buckets(struct qht *ht);
+
 /**
  * qht_insert - Insert a pointer into the hash table
  * @ht: QHT to insert to
@@ -106,6 +108,9 @@ bool qht_insert(struct qht *ht, void *p, uint32_t hash, void **existing);
  */
 void *qht_lookup_custom(const struct qht *ht, const void *userp, uint32_t hash,
                         qht_lookup_func_t func);
+/* Fixed-size bucket scan for LoongArch64; other hosts use the normal lookup. */
+void *qht_lookup_custom_unrolled(const struct qht *ht, const void *userp,
+                                uint32_t hash, qht_lookup_func_t func);
 
 /**
  * qht_lookup - Look up a pointer in a QHT
@@ -185,6 +190,26 @@ bool qht_resize(struct qht *ht, size_t n_elems);
  * See also: qht_iter_remove()
  */
 void qht_iter(struct qht *ht, qht_iter_func_t func, void *userp);
+
+/**
+ * qht_iter_try - Iterate over the immediately available buckets of a QHT
+ * @ht: QHT to be iterated over
+ * @func: function to be called for each entry in an available bucket
+ * @userp: additional pointer to be passed to @func
+ *
+ * Unlike qht_iter(), this function never waits for a bucket lock. A bucket
+ * whose lock cannot be acquired immediately, together with its whole chain,
+ * is skipped. The return value is the number of skipped head buckets.
+ *
+ * This is intended for a post-fork child that inherited a QHT from a
+ * multi-threaded parent. Such a child cannot wait for a lock that was held by
+ * a thread which did not survive fork(). The resulting iteration is therefore
+ * allowed to be incomplete. It may also be used with live writers; the map is
+ * kept alive by RCU, but the result is only a best-effort snapshot.
+ *
+ * Note: @ht cannot be accessed from @func.
+ */
+size_t qht_iter_try(struct qht *ht, qht_iter_func_t func, void *userp);
 
 /**
  * qht_iter_remove - Iterate over a QHT, optionally removing entries

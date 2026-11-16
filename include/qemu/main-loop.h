@@ -327,6 +327,9 @@ bool qemu_in_main_thread(void);
 #define qemu_mutex_lock_iothread()                      \
     qemu_mutex_lock_iothread_impl(__FILE__, __LINE__)
 void qemu_mutex_lock_iothread_impl(const char *file, int line);
+void qemu_mutex_lock_iothread_mmio_impl(const void *mr, const char *name,
+                                        uint64_t offset, bool is_write,
+                                        const char *file, int line);
 
 /**
  * qemu_mutex_unlock_iothread: Unlock the main loop mutex.
@@ -379,6 +382,7 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(IOThreadLockAuto, qemu_iothread_auto_unlock)
  * the calling thread to block on the condition.
  */
 void qemu_cond_wait_iothread(QemuCond *cond);
+void qemu_cond_wait_2_iothread(QemuCond *cond);
 
 /*
  * qemu_cond_timedwait_iothread: like the previous, but with timeout

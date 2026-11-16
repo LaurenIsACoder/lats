@@ -32,6 +32,9 @@ void cpu_load_eflags(CPUX86State *env, int eflags, int update_mask)
 {
     CC_SRC = eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     CC_OP = CC_OP_EFLAGS;
+#ifdef CONFIG_LATX_OPT_EFLAGS
+    __lbt_mtflag_all(CC_SRC);
+#endif
     env->df = 1 - (2 * ((eflags >> 10) & 1));
     env->eflags = (env->eflags & ~update_mask) |
         (eflags & update_mask) | 0x2;

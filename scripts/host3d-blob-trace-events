@@ -1,0 +1,7 @@
+virtio_gpu_cmd_res_create_blob
+virtio_gpu_cmd_res_map_blob
+virtio_gpu_cmd_res_unmap_blob
+virtio_gpu_cmd_res_map_blob_fixed
+virtio_gpu_cmd_res_unmap_blob_fixed
+virtio_gpu_cmd_res_sync_blob
+virtio_gpu_cmd_set_scanout_blob

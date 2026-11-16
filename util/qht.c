@@ -191,6 +191,11 @@ struct qht_map {
 #endif
 };
 
+size_t qht_n_buckets(struct qht *ht)
+{
+    return ht ? ht->map ? ht->map->n_buckets : 0: 0;
+}
+
 /* trigger a resize when n_added_buckets > n_buckets / div */
 #define QHT_NR_ADDED_BUCKETS_THRESHOLD_DIV 8
 
@@ -293,6 +298,20 @@ static inline void qht_bucket_unlock(struct qht_map *map,
                                      struct qht_bucket *b)
 {
     qht_bucket_lock_do(map, b, qemu_spin_unlock);
+}
+
+/* Like qemu_spin_trylock(), returns true when the lock is busy. */
+static inline bool qht_bucket_trylock(struct qht_map *map,
+                                      struct qht_bucket *b)
+{
+#ifdef CONFIG_TSAN
+    unsigned long bucket_idx = b - map->buckets;
+    unsigned long lock_idx = bucket_idx & (QHT_TSAN_BUCKET_LOCKS - 1);
+
+    return qemu_spin_trylock(&map->tsan_bucket_locks[lock_idx].lock);
+#else
+    return qemu_spin_trylock(&b->lock);
+#endif
 }
 
 static inline void qht_head_init(struct qht_map *map, struct qht_bucket *b)
@@ -552,23 +571,41 @@ bool qht_reset_size(struct qht *ht, size_t n_elems)
     return !!new;
 }
 
-static inline
+static inline void *qht_lookup_entry(const struct qht_bucket *b,
+        qht_lookup_func_t func, const void *userp, uint32_t hash, int i)
+{
+    if (qatomic_read(&b->hashes[i]) == hash) {
+        /* Dereferenced before the seqlock retry; preserve RCU read ordering. */
+        void *p = qatomic_rcu_read(&b->pointers[i]);
+        if (likely(p) && likely(func(p, userp))) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static inline __attribute__((always_inline))
 void *qht_do_lookup(const struct qht_bucket *head, qht_lookup_func_t func,
-                    const void *userp, uint32_t hash)
+                    const void *userp, uint32_t hash, bool unroll)
 {
     const struct qht_bucket *b = head;
     int i;
 
     do {
-        for (i = 0; i < QHT_BUCKET_ENTRIES; i++) {
-            if (qatomic_read(&b->hashes[i]) == hash) {
-                /* The pointer is dereferenced before seqlock_read_retry,
-                 * so (unlike qht_insert__locked) we need to use
-                 * qatomic_rcu_read here.
-                 */
-                void *p = qatomic_rcu_read(&b->pointers[i]);
-
-                if (likely(p) && likely(func(p, userp))) {
+        if (unroll) {
+            /* All four hashes share a cache line. */
+#pragma GCC unroll 4
+            for (i = 0; i < QHT_BUCKET_ENTRIES; i++) {
+                void *p = qht_lookup_entry(b, func, userp, hash, i);
+                if (p) {
+                    return p;
+                }
+            }
+        } else {
+#pragma GCC unroll 1
+            for (i = 0; i < QHT_BUCKET_ENTRIES; i++) {
+                void *p = qht_lookup_entry(b, func, userp, hash, i);
+                if (p) {
                     return p;
                 }
             }
@@ -588,13 +625,14 @@ void *qht_lookup__slowpath(const struct qht_bucket *b, qht_lookup_func_t func,
 
     do {
         version = seqlock_read_begin(&b->sequence);
-        ret = qht_do_lookup(b, func, userp, hash);
+        ret = qht_do_lookup(b, func, userp, hash, false);
     } while (seqlock_read_retry(&b->sequence, version));
     return ret;
 }
 
-void *qht_lookup_custom(const struct qht *ht, const void *userp, uint32_t hash,
-                        qht_lookup_func_t func)
+static inline __attribute__((always_inline))
+void *qht_lookup_custom_impl(const struct qht *ht, const void *userp,
+                            uint32_t hash, qht_lookup_func_t func, bool unroll)
 {
     const struct qht_bucket *b;
     const struct qht_map *map;
@@ -605,7 +643,7 @@ void *qht_lookup_custom(const struct qht *ht, const void *userp, uint32_t hash,
     b = qht_map_to_bucket(map, hash);
 
     version = seqlock_read_begin(&b->sequence);
-    ret = qht_do_lookup(b, func, userp, hash);
+    ret = qht_do_lookup(b, func, userp, hash, unroll);
     if (likely(!seqlock_read_retry(&b->sequence, version))) {
         return ret;
     }
@@ -614,6 +652,22 @@ void *qht_lookup_custom(const struct qht *ht, const void *userp, uint32_t hash,
      * running a 100%-lookup microbenchmark.
      */
     return qht_lookup__slowpath(b, func, userp, hash);
+}
+
+void *qht_lookup_custom(const struct qht *ht, const void *userp, uint32_t hash,
+                        qht_lookup_func_t func)
+{
+    return qht_lookup_custom_impl(ht, userp, hash, func, false);
+}
+
+void *qht_lookup_custom_unrolled(const struct qht *ht, const void *userp,
+                                uint32_t hash, qht_lookup_func_t func)
+{
+#if defined(__loongarch__) && HOST_LONG_BITS == 64
+    return qht_lookup_custom_impl(ht, userp, hash, func, true);
+#else
+    return qht_lookup_custom_impl(ht, userp, hash, func, false);
+#endif
 }
 
 void *qht_lookup(const struct qht *ht, const void *userp, uint32_t hash)
@@ -886,6 +940,36 @@ void qht_iter(struct qht *ht, qht_iter_func_t func, void *userp)
     };
 
     do_qht_iter(ht, &iter, userp);
+}
+
+size_t qht_iter_try(struct qht *ht, qht_iter_func_t func, void *userp)
+{
+    const struct qht_iter iter = {
+        .f.retvoid = func,
+        .type = QHT_ITER_VOID,
+    };
+    struct qht_map *map;
+    size_t skipped = 0;
+
+    rcu_read_lock();
+    map = qatomic_rcu_read(&ht->map);
+    if (!map) {
+        rcu_read_unlock();
+        return 0;
+    }
+
+    for (size_t i = 0; i < map->n_buckets; i++) {
+        struct qht_bucket *bucket = &map->buckets[i];
+
+        if (qht_bucket_trylock(map, bucket)) {
+            skipped++;
+            continue;
+        }
+        qht_bucket_iter(bucket, &iter, userp);
+        qht_bucket_unlock(map, bucket);
+    }
+    rcu_read_unlock();
+    return skipped;
 }
 
 void qht_iter_remove(struct qht *ht, qht_iter_bool_func_t func, void *userp)

@@ -33,7 +33,8 @@ G_NORETURN void helper_raise_interrupt(CPUX86State *env, int intno,
 
 G_NORETURN void helper_raise_exception(CPUX86State *env, int exception_index)
 {
-    raise_exception(env, exception_index);
+    // raise_exception(env, exception_index);
+    raise_exception_ra(env, exception_index, GETPC());
 }
 
 /*
@@ -107,6 +108,10 @@ void raise_interrupt2(CPUX86State *env, int intno,
     env->error_code = error_code;
     env->exception_is_int = is_int;
     env->exception_next_eip = env->eip + next_eip_addend;
+    if(intno == EXCP00_DIVZ) {
+        env->excp_divz = 0;
+    }
+ 
     cpu_loop_exit_restore(cs, retaddr);
 }
 

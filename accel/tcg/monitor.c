@@ -60,7 +60,7 @@ HumanReadableText *qmp_x_query_jit(Error **errp)
     }
 
     dump_accel_info(buf);
-    dump_exec_info(buf);
+    dump_exec_info(buf, 0);
     dump_drift_info(buf);
 
     return human_readable_text_from_str(buf);

@@ -147,6 +147,7 @@
 #ifndef CLONE_IO
 #define CLONE_IO                0x80000000      /* Clone io context */
 #endif
+#include "latx-sys-env-init-func.h"
 
 /* We can't directly call the host clone syscall, because this will
  * badly confuse libc (breaking mutexes, for example). So we must
@@ -358,7 +359,8 @@ _syscall3(int, sys_sched_getaffinity, pid_t, pid, unsigned int, len,
 #define __NR_sys_sched_setaffinity __NR_sched_setaffinity
 _syscall3(int, sys_sched_setaffinity, pid_t, pid, unsigned int, len,
           unsigned long *, user_mask_ptr);
-/* sched_attr is not defined in glibc */
+/* sched_attr is not defined in older glibc/kernel header combinations. */
+#ifndef CONFIG_HAVE_STRUCT_SCHED_ATTR
 struct sched_attr {
     uint32_t size;
     uint32_t sched_policy;
@@ -371,6 +373,7 @@ struct sched_attr {
     uint32_t sched_util_min;
     uint32_t sched_util_max;
 };
+#endif
 #define __NR_sys_sched_getattr __NR_sched_getattr
 _syscall4(int, sys_sched_getattr, pid_t, pid, struct sched_attr *, attr,
           unsigned int, size, unsigned int, flags);
@@ -6623,7 +6626,14 @@ static abi_long do_prctl(CPUArchState *env, abi_long option, abi_long arg2,
     }
 }
 
+#ifdef CONFIG_LATX_OPT
+/* LATX translation buffers in static TLS exceed the generic 256 KiB stack.
+ * pthread_create reserves TLS from this allocation before the usable stack.
+ */
+#define NEW_STACK_SIZE 0x100000
+#else
 #define NEW_STACK_SIZE 0x40000
+#endif
 
 
 static pthread_mutex_t clone_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -6650,6 +6660,7 @@ static void *clone_func(void *arg)
     env = info->env;
     cpu = env_cpu(env);
     thread_cpu = cpu;
+    latx_lsenv_init(env);
     ts = (TaskState *)cpu->opaque;
     info->tid = sys_gettid();
     task_settid(ts);

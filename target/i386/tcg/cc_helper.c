@@ -220,10 +220,12 @@ target_ulong helper_cc_compute_all(target_ulong dst, target_ulong src1,
     }
 }
 
+#ifndef CONFIG_LATX_OPT_EFLAGS
 uint32_t cpu_cc_compute_all(CPUX86State *env, int op)
 {
     return helper_cc_compute_all(CC_DST, CC_SRC, CC_SRC2, op);
 }
+#endif
 
 target_ulong helper_cc_compute_c(target_ulong dst, target_ulong src1,
                                  target_ulong src2, int op)

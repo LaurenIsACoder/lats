@@ -5,6 +5,7 @@
 #include <semaphore.h>
 
 struct QemuMutex {
+    pthread_spinlock_t spin;
     pthread_mutex_t lock;
 #ifdef CONFIG_DEBUG_MUTEX
     const char *file;
@@ -22,6 +23,9 @@ typedef struct QemuRecMutex {
 } QemuRecMutex;
 
 struct QemuCond {
+    unsigned long wait_seq;
+    unsigned long release_seq;
+    unsigned futex_seq;
     pthread_cond_t cond;
     bool initialized;
 };

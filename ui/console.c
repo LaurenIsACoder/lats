@@ -1570,6 +1570,35 @@ DisplaySurface *qemu_create_displaysurface(int width, int height)
     return surface;
 }
 
+DisplaySurface *qemu_create_displaysurface_bpp(int width, int height, int bpp)
+{
+    DisplaySurface *surface;
+    void *bits = NULL;
+#ifdef WIN32
+    HANDLE handle = NULL;
+#endif
+
+    trace_displaysurface_create(width, height);
+
+#ifdef WIN32
+    bits = qemu_win32_map_alloc(width * height * 4, &handle, &error_abort);
+#endif
+
+    pixman_format_code_t format =
+        qemu_default_pixman_format(bpp, true);
+    surface = qemu_create_displaysurface_from(
+        width, height,
+        format,
+        width * bpp / 8, bits
+    );
+    surface->flags = QEMU_ALLOCATED_FLAG;
+
+#ifdef WIN32
+    qemu_displaysurface_win32_set_handle(surface, handle, 0);
+#endif
+    return surface;
+}
+
 DisplaySurface *qemu_create_displaysurface_from(int width, int height,
                                                 pixman_format_code_t format,
                                                 int linesize, uint8_t *data)

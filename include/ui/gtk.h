@@ -43,6 +43,8 @@ typedef struct VirtualGfxConsole {
     cairo_surface_t *surface;
     double scale_x;
     double scale_y;
+    GdkCursor *guest_cursor;
+    bool guest_cursor_visible;
 #if defined(CONFIG_OPENGL)
     QemuGLShader *gls;
     EGLContext ectx;
