@@ -22,6 +22,7 @@
 #include "standard-headers/linux/virtio_config.h"
 #include "standard-headers/linux/virtio_ring.h"
 #include "qom/object.h"
+#include "block/aio.h"
 
 /*
  * A guest should never accept this. It implies negotiation is broken
@@ -135,6 +136,7 @@ struct VirtIODevice
     bool broken; /* device in invalid state, needs reset */
     bool use_disabled_flag; /* allow use of 'disable' flag when needed */
     bool disabled; /* device in temporarily disabled state */
+    bool reset_pending; /* deferred transport reset blocks device activity */
     /**
      * @use_started: true if the @started flag should be used to check the
      * current state of the VirtIO device. Otherwise status bits
@@ -184,6 +186,8 @@ struct VirtioDeviceClass {
     void (*set_config)(VirtIODevice *vdev, const uint8_t *config);
     void (*reset)(VirtIODevice *vdev);
     void (*set_status)(VirtIODevice *vdev, uint8_t val);
+    /* Defer modern transport reset until it can run in the main loop. */
+    bool defer_modern_guest_reset;
     /* Device must validate queue_index.  */
     void (*queue_reset)(VirtIODevice *vdev, uint32_t queue_index);
     /* Device must validate queue_index.  */
@@ -502,10 +506,23 @@ static inline void virtio_set_disabled(VirtIODevice *vdev, bool disable)
 
 static inline bool virtio_device_disabled(VirtIODevice *vdev)
 {
-    return unlikely(vdev->disabled || vdev->broken);
+    return unlikely(vdev->disabled || vdev->reset_pending || vdev->broken);
 }
 
 bool virtio_legacy_allowed(VirtIODevice *vdev);
 bool virtio_legacy_check_disabled(VirtIODevice *vdev);
+
+QEMUBH *virtio_bh_new_guarded_full(DeviceState *dev,
+                                   QEMUBHFunc *cb, void *opaque,
+                                   const char *name);
+#define virtio_bh_new_guarded(dev, cb, opaque) \
+    virtio_bh_new_guarded_full((dev), (cb), (opaque), (stringify(cb)))
+
+/* The I/O variant runs only on the main-loop thread. */
+QEMUBH *virtio_bh_io_new_guarded_full(DeviceState *dev,
+                                      QEMUBHFunc *cb, void *opaque,
+                                      const char *name);
+#define virtio_bh_io_new_guarded(dev, cb, opaque) \
+    virtio_bh_io_new_guarded_full((dev), (cb), (opaque), (stringify(cb)))
 
 #endif

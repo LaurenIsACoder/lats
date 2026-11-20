@@ -45,6 +45,7 @@
 #include "sysemu/seccomp.h"
 #include "sysemu/tcg.h"
 #include "sysemu/xen.h"
+#include "sysemu/rr.h"
 
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
@@ -134,6 +135,8 @@
 #include "sysemu/iothread.h"
 #include "qemu/guest-random.h"
 #include "qemu/keyval.h"
+
+#include "hamt-cpu.h"
 
 #define MAX_VIRTIO_CONSOLES 1
 
@@ -501,6 +504,22 @@ static QemuOptsList qemu_action_opts = {
     },
 };
 
+static QemuOptsList qemu_opt_bql_opts = {
+    .name = "optbql",
+    .implied_opt_name = "waitn",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_opt_bql_opts.head),
+    .merge_lists = true,
+    .desc = {
+        {
+            .name = "waitn",
+            .type = QEMU_OPT_NUMBER,
+        },
+        { /* end of list */ }
+    },
+};
+
+void optbql_parse_options(QemuOpts *opts);
+
 const char *qemu_get_vm_name(void)
 {
     return qemu_name;
@@ -829,10 +848,15 @@ static MachineClass *find_default_machine(GSList *machines)
     return default_machineclass;
 }
 
+#include "latx-version.h"
 static void version(void)
 {
+#if 0
     printf("QEMU emulator version " QEMU_FULL_VERSION "\n"
            QEMU_COPYRIGHT "\n");
+#else
+    printf("LATX-SYS " QEMU_FULL_VERSION"-"LATX_VERSION"\n");
+#endif
 }
 
 static void help(int exitcode)
@@ -1981,6 +2005,9 @@ static void qemu_resolve_machine_memdev(void)
             error_report("Memory backend '%s' not found", ram_memdev_id);
             exit(EXIT_FAILURE);
         }
+        host_memory_backend_prepare(MEMORY_BACKEND(backend),
+                                    LATX_BACKEND_GUEST_RAM, 0, &error_fatal);
+
         if (!have_custom_ram_size) {
             backend_size = object_property_get_uint(backend, "size",  &error_abort);
             current_machine->ram_size = backend_size;
@@ -2547,6 +2574,8 @@ static void qemu_init_board(void)
     /* From here on we enter MACHINE_PHASE_INITIALIZED.  */
     machine_run_board_init(current_machine, mem_path, &error_fatal);
 
+    hamt_cpus_num = current_machine->smp.max_cpus;
+
     drive_check_orphaned();
 
     realtime_init();
@@ -2666,16 +2695,286 @@ void qmp_x_exit_preconfig(Error **errp)
     }
 }
 
+static QemuOptsList qemu_rrtrace_opts = {
+    .name = "rrtrace",
+    .implied_opt_name = "mode",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_rrtrace_opts.head),
+    .desc = {
+        {
+            .name = "mode",
+            .type = QEMU_OPT_STRING,
+        }, {
+            .name = "level",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "file",
+            .type = QEMU_OPT_STRING,
+        }, {
+            .name = "func",
+            .type = QEMU_OPT_STRING,
+        }, {
+            .name = "noeflags",
+            .type = QEMU_OPT_BOOL,
+        }, {
+            .name = "dumptbpc",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "verbose",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "begin",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "end",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "stride",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "begini",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "endi",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "stridei",
+            .type = QEMU_OPT_NUMBER,
+        }, {
+            .name = "mask",
+            .type = QEMU_OPT_NUMBER,
+        },
+        { /* end of list */ }
+    },
+};
+
+int rrtrace_mode;   /* str=1, bin=2 */
+int rrtrace_level;  /* TB=1, FPU=2, SIMD=3 */
+int rrtrace_mask;  /* [5]EF [4]CR [3]XMM [2]FPR, [1]GPR, [0]PC */
+FILE *rrtrace_file;
+const char *rrtrace_file_name;
+int rrtrace_func;   /* output=1, compare(bin only)=2 */
+
+#define RRTRACE_LEVEL_ASSERT(level) do {    \
+    assert(1 <= level && level <= 3);       \
+} while (0)
+
+int rrtrace_config;
+#define RRTRACE_CFG_SET_NOEFLAGS() do {     \
+    rrtrace_config |= (0x1 << 0);           \
+} while (0)
+
+int rrtrace_verbose;
+uint64_t rrtrace_begin_tbcount=0ULL;
+uint64_t rrtrace_end_tbcount=-1ULL;
+uint64_t rrtrace_tbcount_stride=1000000ULL;
+
+uint64_t rrtrace_begin_icount=0ULL;
+uint64_t rrtrace_end_icount=-1ULL;
+uint64_t rrtrace_icount_stride=10000000ULL;
+uint64_t rrtrace_icount_save=0ULL;
+
+static void rrtrace_parse_mode(const char *mode)
+{
+    rrtrace_mode = 0;
+    if (strncmp(mode, "str", 3) == 0) {
+        rrtrace_mode = 1;
+    } else if (strncmp(mode, "bin", 3) == 0) {
+        rrtrace_mode = 2;
+    } else if (strncmp(mode, "dump", 4) == 0) {
+        rrtrace_mode = 3;
+    }
+}
+
+static void rrtrace_parse_level(uint64_t level)
+{
+    rrtrace_level = 0;
+    RRTRACE_LEVEL_ASSERT(level);
+    rrtrace_level = level;
+}
+
+static void rrtrace_parse_mask(uint64_t mask)
+{
+    rrtrace_mask = mask;
+}
+
+static void rrtrace_parse_noeflags(bool noeflags)
+{
+    if (noeflags) RRTRACE_CFG_SET_NOEFLAGS();
+}
+
+static void rrtrace_parse_file(const char *file)
+{
+    rrtrace_file = NULL;
+    rrtrace_file_name = file;
+}
+
+static void rrtrace_parse_func(const char *func)
+{
+    rrtrace_func = 0;
+    if (strncmp(func, "out", 3) == 0) {
+        rrtrace_func = 1;
+    } else if (strncmp(func, "cmp", 3) == 0) {
+        rrtrace_func = 2;
+    } else if (strncmp(func, "dumppc", 6) == 0) {
+        rrtrace_func = 3;
+    } else if (strncmp(func, "dumpnr", 6) == 0) {
+        rrtrace_func = 4;
+    }
+}
+
+uint64_t rrtrace_dump_tb_pc;
+
+static void rrtrace_parse_dump(int target, uint64_t data)
+{
+    if (target == 1) {
+        /* dump tb according to pc */
+        rrtrace_dump_tb_pc = data;
+    }
+}
+
+static void rrtrace_parse_verbose(uint64_t data)
+{
+    rrtrace_verbose = data;
+}
+
+static void rrtrace_parse_begin(uint64_t data) {
+    rrtrace_begin_tbcount = data;
+}
+static void rrtrace_parse_end(uint64_t data) {
+    rrtrace_end_tbcount = data;
+}
+static void rrtrace_parse_stride(uint64_t data) {
+    rrtrace_tbcount_stride = data;
+}
+
+static void rrtrace_parse_begini(uint64_t data) {
+    rrtrace_begin_icount = data;
+}
+static void rrtrace_parse_endi(uint64_t data) {
+    rrtrace_end_icount = data;
+}
+static void rrtrace_parse_stridei(uint64_t data) {
+    rrtrace_icount_stride = data;
+}
+
+
+#include "qemu/option_int.h"
+
+static void rrtrace_parse_qemu_opts(QemuOpts *opts)
+{
+    QemuOpt *opt;
+
+    opt = qemu_opt_find(opts, "mode");
+    if (opt) rrtrace_parse_mode(opt->str);
+
+    opt = qemu_opt_find(opts, "level");
+    if (opt) rrtrace_parse_level(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "file");
+    if (opt) rrtrace_parse_file(opt->str);
+
+    opt = qemu_opt_find(opts, "func");
+    if (opt) rrtrace_parse_func(opt->str);
+
+    opt = qemu_opt_find(opts, "noeflags");
+    if (opt) rrtrace_parse_noeflags(opt->value.boolean);
+
+    opt = qemu_opt_find(opts, "dumptbpc");
+    if (opt) rrtrace_parse_dump(1, opt->value.uint);
+
+    opt = qemu_opt_find(opts, "verbose");
+    if (opt) rrtrace_parse_verbose(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "begin");
+    if (opt) rrtrace_parse_begin(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "end");
+    if (opt) rrtrace_parse_end(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "stride");
+    if (opt) rrtrace_parse_stride(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "begini");
+    if (opt) rrtrace_parse_begini(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "endi");
+    if (opt) rrtrace_parse_endi(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "stridei");
+    if (opt) rrtrace_parse_stridei(opt->value.uint);
+
+    opt = qemu_opt_find(opts, "mask");
+    if (opt) rrtrace_parse_mask(opt->value.uint);
+
+    if (rrtrace_mode == 1) {
+        assert(rrtrace_func == 1);
+    }
+
+    rrtrace_file = stderr;
+    printf("%s rrtrace mode %d file %s func %d mask %x\n",
+            __func__,
+            rrtrace_mode,
+            rrtrace_file_name,
+            rrtrace_func, rrtrace_mask);
+    if (rrtrace_mode == 3) {
+        if (rrtrace_func == 3) {
+            printf("%s rrtrace dump tb pc %#lx\n",
+                    __func__, rrtrace_dump_tb_pc);
+        }
+    }
+    printf("%s rrtrace begin tbcount at %lu (not included) end at %lu \n",
+            __func__, rrtrace_begin_tbcount,rrtrace_end_tbcount);
+    printf("%s rrtrace begin icount  at %lu (not included) end at %lu \n",
+            __func__, rrtrace_begin_icount,rrtrace_end_icount);
+    if (rrtrace_file_name != 0) {
+        if (rrtrace_func == 1) {
+            rrtrace_file = fopen(rrtrace_file_name, "w");
+        } else if (rrtrace_func == 2) {
+            rrtrace_file = fopen(rrtrace_file_name, "r");
+        }
+    }
+    assert(rrtrace_file != NULL);
+    assert(rrtrace_begin_tbcount < rrtrace_end_tbcount);
+    assert(rrtrace_begin_icount < rrtrace_end_icount);
+}
+
+extern void latxs_options_init2(void);
+extern QemuOptsList qemu_latx_opts;
+extern void latx_parse_options(QemuOpts *opts);
+extern void latx_parse_env_options(void);
+
+extern void latxs_verbose_tcg_options(void);
+extern void aot_init(void);
+extern int option_tb_record;
+extern const char *option_tb_record_path;
+extern int tb_record_init(const char *output_path);
+extern int option_aot_verify;
+extern int check_aot_verify_mode(int argc, char **argv);
+extern int run_aot_verify_mode(int argc, char **argv, int verify_idx);
+
 void qemu_init(int argc, char **argv)
 {
     QemuOpts *opts;
     QemuOpts *icount_opts = NULL, *accel_opts = NULL;
+    QemuOpts *rrtrace_opts;
+    QemuOpts *latx_opts;
+    QemuOpts *optbql_opts;
     QemuOptsList *olist;
     int optind;
     const char *optarg;
     MachineClass *machine_class;
     bool userconfig = true;
     FILE *vmstate_dump_file = NULL;
+
+    /* Check for AOT verify mode first, before any option parsing that would exit on unknown options */
+    error_init(argv[0]);
+    {
+        int aot_verify_idx = check_aot_verify_mode(argc, argv);
+        if (aot_verify_idx) {
+            option_aot_verify = 1;
+            exit(run_aot_verify_mode(argc, argv, aot_verify_idx));
+        }
+    }
 
     qemu_add_opts(&qemu_drive_opts);
     qemu_add_drive_opts(&qemu_legacy_drive_opts);
@@ -2691,6 +2990,8 @@ void qemu_init(int argc, char **argv)
     qemu_add_opts(&qemu_global_opts);
     qemu_add_opts(&qemu_mon_opts);
     qemu_add_opts(&qemu_trace_opts);
+    qemu_add_opts(&qemu_rrtrace_opts);
+    qemu_add_opts(&qemu_latx_opts);
     qemu_plugin_add_opts();
     qemu_add_opts(&qemu_option_rom_opts);
     qemu_add_opts(&qemu_accel_opts);
@@ -2708,9 +3009,9 @@ void qemu_init(int argc, char **argv)
     qemu_add_opts(&qemu_semihosting_config_opts);
     qemu_add_opts(&qemu_fw_cfg_opts);
     qemu_add_opts(&qemu_action_opts);
+    qemu_add_opts(&qemu_opt_bql_opts);
     module_call_init(MODULE_INIT_OPTS);
 
-    error_init(argv[0]);
     qemu_init_exec_dir(argv[0]);
 
     qemu_init_arch_modules();
@@ -2732,10 +3033,10 @@ void qemu_init(int argc, char **argv)
                 userconfig = false;
                 break;
             }
-        }
-    }
+         }
+     }
 
-    machine_opts_dict = qdict_new();
+     machine_opts_dict = qdict_new();
     if (userconfig) {
         qemu_read_default_config_file(&error_fatal);
     }
@@ -3419,6 +3720,21 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_trace:
                 trace_opt_parse(optarg);
                 break;
+            case QEMU_OPTION_rrtrace:
+                rrtrace_opts = qemu_opts_parse_noisily(qemu_find_opts("rrtrace"),
+                                                       optarg, true);
+                rrtrace_parse_qemu_opts(rrtrace_opts);
+                break;
+            case QEMU_OPTION_latx:
+                latx_opts = qemu_opts_parse_noisily(qemu_find_opts("latx"),
+                                                       optarg, true);
+                latx_parse_options(latx_opts);
+                break;
+            case QEMU_OPTION_opt_bql:
+                optbql_opts = qemu_opts_parse_noisily(qemu_find_opts("optbql"),
+                                                       optarg, true);
+                optbql_parse_options(optbql_opts);
+                break;
             case QEMU_OPTION_plugin:
                 qemu_plugin_opt_parse(optarg, &plugin_list);
                 break;
@@ -3540,6 +3856,18 @@ void qemu_init(int argc, char **argv)
      */
     loc_set_none();
 
+    latx_parse_env_options();
+    latxs_options_init2();
+
+    aot_init();
+
+    if (option_tb_record && option_tb_record_path) {
+        if (tb_record_init(option_tb_record_path) < 0) {
+            error_report("Failed to initialize TB recording: %s", strerror(errno));
+            exit(1);
+        }
+    }
+
     qemu_validate_options(machine_opts_dict);
     qemu_process_sugar_options();
 
@@ -3594,6 +3922,7 @@ void qemu_init(int argc, char **argv)
      * after qemu_apply_machine_options.
      */
     configure_accelerators(argv[0]);
+    latxs_verbose_tcg_options();
     phase_advance(PHASE_ACCEL_CREATED);
 
     /*
@@ -3625,12 +3954,6 @@ void qemu_init(int argc, char **argv)
      */
     qemu_create_late_backends();
 
-    /*
-     * Note: creates a QOM object, must run only after global and
-     * compat properties have been set up.
-     */
-    migration_object_init();
-
     /* parse features once if machine provides default cpu_type */
     current_machine->cpu_type = machine_class->default_cpu_type;
     if (cpu_option) {
@@ -3640,6 +3963,12 @@ void qemu_init(int argc, char **argv)
 
     qemu_resolve_machine_memdev();
     parse_numa_opts(current_machine);
+    /*
+     * Backend roles and memory regions must be ready before migration
+     * compatibility checks inspect them.
+     */
+    migration_object_init();
+
 
     if (vmstate_dump_file) {
         /* dump and exit */

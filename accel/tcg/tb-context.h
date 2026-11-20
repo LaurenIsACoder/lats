@@ -23,20 +23,33 @@
 #include "qemu/thread.h"
 #include "qemu/qht.h"
 
-#define CODE_GEN_HTABLE_BITS     15
+//#define CODE_GEN_HTABLE_BITS     15
+#define CODE_GEN_HTABLE_BITS     22
 #define CODE_GEN_HTABLE_SIZE     (1 << CODE_GEN_HTABLE_BITS)
 
 typedef struct TBContext TBContext;
 
 struct TBContext {
 
-    struct qht htable;
+    struct qht htable[MTCC_NR];
+    int n;
 
     /* statistics */
     unsigned tb_flush_count;
     unsigned tb_phys_invalidate_count;
+
+    uint32_t tb_flush_count_mtcc[MTCC_NR];
+    uint32_t tb_phys_invalidate_count_mtcc[MTCC_NR];
 };
 
 extern TBContext tb_ctx;
+
+#if HOST_LONG_BITS == 32
+#define QHT_BUCKET_ENTRIES 6
+#else /* 64-bit */
+#define QHT_BUCKET_ENTRIES 4
+#endif
+
+#include "latx/include/latx-shadow-htable.h"
 
 #endif

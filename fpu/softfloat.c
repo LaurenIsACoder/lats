@@ -1351,9 +1351,7 @@ static void frac128_modrem(FloatParts128 *a, FloatParts128 *b,
         t2 = 0;
     }
 
-    if (mod_quot) {
-        *mod_quot = quot;
-    } else {
+    if (*mod_quot) {
         sub192(t0, t1, t2, a0, a1, a2, &t0, &t1, &t2);
         if (lt192(t0, t1, t2, a0, a1, a2) ||
             (eq192(t0, t1, t2, a0, a1, a2) && (q & 1))) {
@@ -1361,8 +1359,11 @@ static void frac128_modrem(FloatParts128 *a, FloatParts128 *b,
             a1 = t1;
             a2 = t2;
             a->sign = !a->sign;
+            ++quot;
         }
     }
+
+    *mod_quot = quot;
 
     if (likely(a0)) {
         shift = clz64(a0);
@@ -2625,12 +2626,12 @@ floatx80 floatx80_modrem(floatx80 a, floatx80 b, bool mod,
 {
     FloatParts128 pa, pb, *pr;
 
-    *quotient = 0;
+    *quotient = mod ? 0 : 1;
     if (!floatx80_unpack_canonical(&pa, a, status) ||
         !floatx80_unpack_canonical(&pb, b, status)) {
         return floatx80_default_nan(status);
     }
-    pr = parts_modrem(&pa, &pb, mod ? quotient : NULL, status);
+    pr = parts_modrem(&pa, &pb, quotient, status);
 
     return floatx80_round_pack_canonical(pr, status);
 }

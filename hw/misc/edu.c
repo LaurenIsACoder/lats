@@ -297,9 +297,33 @@ static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
+static bool edu_mmio_access_lockless(void *opaque, hwaddr addr,
+                                     unsigned size, bool is_write,
+                                     MemTxAttrs attrs)
+{
+    (void)opaque;
+    (void)attrs;
+
+    /* The unused BAR area has no state or side effects. */
+    if (addr >= 0x100) {
+        return true;
+    }
+
+    if (size != 4) {
+        return false;
+    }
+
+    if (is_write) {
+        return addr == 0x20;
+    }
+
+    return addr == 0x00 || addr == 0x08 || addr == 0x20;
+}
+
 static const MemoryRegionOps edu_mmio_ops = {
     .read = edu_mmio_read,
     .write = edu_mmio_write,
+    .access_lockless = edu_mmio_access_lockless,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = {
         .min_access_size = 4,

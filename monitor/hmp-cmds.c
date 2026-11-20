@@ -30,6 +30,64 @@
 #include "qemu/log.h"
 #include "sysemu/sysemu.h"
 
+#ifdef CONFIG_LATX_PROFILER
+extern int latx_tb_profile_split_sort;
+extern int latx_tb_profile_enabled;
+void latx_tb_profile_print_and_clear(int tbbytime);
+#endif
+
+void hmp_info_qcprofile(Monitor *mon, const QDict *qdict)
+{
+#ifdef CONFIG_LATX_PROFILER
+    bool show = qdict_get_try_bool(qdict, "show", false);
+    bool splitsort = qdict_get_try_bool(qdict, "splitsort", false);
+    bool tb = qdict_get_try_bool(qdict, "tbprofile", false);
+    bool tbbytime = qdict_get_try_bool(qdict, "tbprofilebytime", false);
+    bool tbbytimeavg = qdict_get_try_bool(qdict, "tbprofilebyavgtime", false);
+    bool tbbytimetlbr = qdict_get_try_bool(qdict, "tbprofilebytlbrtime", false);
+    bool tbbytimetlbrp = qdict_get_try_bool(qdict, "tbprofilebytlbrtimep", false);
+    bool tubytime = qdict_get_try_bool(qdict, "tuprofilebytime", false);
+
+    tb = tb || tbbytime || tbbytimeavg || tbbytimetlbr || tbbytimetlbrp || tubytime;
+    int tbbytimemode = 0;
+    if (tbbytime) tbbytimemode = 1;
+    if (tbbytimeavg) tbbytimemode = 2;
+    if (tbbytimetlbr) tbbytimemode = 3;
+    if (tbbytimetlbrp) tbbytimemode = 4;
+    if (tubytime) tbbytimemode = 5;
+
+    if (splitsort) {
+        latx_tb_profile_split_sort = latx_tb_profile_split_sort ? 0 : 1;
+        show = 1;
+    }
+
+    if (show) {
+        monitor_printf(mon, "QEMU Counter Profile : tb=%d:%s (rdtime %d %d) SplitSort=%d\n",
+                             latx_tb_profile_enabled,
+                             latx_tb_profile_enabled ? "profiling" : "stopped",
+                             tbbytime, tbbytimeavg,
+                             latx_tb_profile_split_sort);
+        return;
+    }
+
+    if (tb) {
+        latx_tb_profile_enabled = latx_tb_profile_enabled ? 0 : 1;
+    }
+
+    monitor_printf(mon, "QEMU Counter Profile : tb(%d)=%d:%s SplitSort=%d\n",
+                         tb ? 1 : 0,
+                         latx_tb_profile_enabled,
+                         latx_tb_profile_enabled ? "start" : "end",
+                         latx_tb_profile_split_sort);
+
+    if (tb) {
+        latx_tb_profile_print_and_clear(tbbytimemode);
+    }
+#else
+    monitor_printf(mon, "%s:%d latx-tb-profiler disabled\n", __func__, __LINE__);
+#endif
+}
+
 bool hmp_handle_error(Monitor *mon, Error *err)
 {
     if (err) {
@@ -440,6 +498,7 @@ void hmp_info_mtree(Monitor *mon, const QDict *qdict)
     bool dispatch_tree = qdict_get_try_bool(qdict, "dispatch_tree", false);
     bool owner = qdict_get_try_bool(qdict, "owner", false);
     bool disabled = qdict_get_try_bool(qdict, "disabled", false);
+    bool ramblock = qdict_get_try_bool(qdict, "ramblock", false);
 
-    mtree_info(flatview, dispatch_tree, owner, disabled);
+    mtree_info(flatview, dispatch_tree, owner, disabled, ramblock);
 }

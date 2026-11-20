@@ -30,6 +30,10 @@
 extern void __gcov_dump(void);
 #endif
 
+#if defined(CONFIG_LATX_PROFILER)
+void latx_sys_user_dump_exec_info(void);
+#endif
+
 void preexit_cleanup(CPUArchState *env, int code)
 {
 #ifdef CONFIG_GPROF
@@ -38,6 +42,11 @@ void preexit_cleanup(CPUArchState *env, int code)
 #ifdef CONFIG_GCOV
         __gcov_dump();
 #endif
+
+#if defined(CONFIG_LATX_PROFILER)
+        latx_sys_user_dump_exec_info();
+#endif
+
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();

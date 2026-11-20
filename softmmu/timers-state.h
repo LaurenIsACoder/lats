@@ -51,6 +51,7 @@ typedef struct TimersState {
 
     int64_t vm_clock_warp_start;
     int64_t cpu_clock_offset;
+    int64_t cpu_clock_offset_ticks;
 
     /* Only written by TCG thread */
     int64_t qemu_icount;

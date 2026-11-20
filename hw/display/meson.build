@@ -78,6 +78,9 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
                          if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c'), pixman, virgl])
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
+  else
+      virtio_gpu_ss.add(when: 'CONFIG_VIRTIO_GPU',
+                        if_true: [files('virtio-gpu-stub.c')])
   endif
 endif
 

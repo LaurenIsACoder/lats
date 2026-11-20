@@ -431,6 +431,26 @@ void rcu_disable_atfork(void)
 }
 
 #ifdef CONFIG_POSIX
+static __thread bool fork_snapshot;
+
+pid_t rcu_fork_snapshot(void)
+{
+    pid_t pid;
+    int saved_errno;
+
+    assert(qemu_mutex_iothread_locked());
+    assert(get_ptr_rcu_reader()->depth == 0);
+    assert(!fork_snapshot);
+    fork_snapshot = true;
+    rcu_enable_atfork();
+    pid = fork();
+    saved_errno = errno;
+    rcu_disable_atfork();
+    fork_snapshot = false;
+    errno = saved_errno;
+    return pid;
+}
+
 static void rcu_init_lock(void)
 {
     if (atfork_depth < 1) {
@@ -458,6 +478,17 @@ static void rcu_init_child(void)
     }
 
     memset(&registry, 0, sizeof(registry));
+    if (fork_snapshot) {
+        /*
+         * Keep snapshot objects alive, and discard the vanished consumer's
+         * local batch as well as partially published producer queue links.
+         */
+        dummy.next = NULL;
+        head = &dummy;
+        tail = &dummy.next;
+        rcu_call_count = 0;
+        in_drain_call_rcu = 0;
+    }
     rcu_init_complete();
 }
 #endif

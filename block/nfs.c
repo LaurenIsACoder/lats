@@ -270,11 +270,18 @@ static int coroutine_fn nfs_co_preadv(BlockDriverState *bs, int64_t offset,
     NFSRPC task;
 
     nfs_co_init_task(bs, &task);
-    task.iov = iov;
 
     WITH_QEMU_LOCK_GUARD(&client->mutex) {
+#ifdef LIBNFS_API_V2
+	if (nfs_pread_async(client->context, client->fh,
+			    iov->iov[0].iov_base,
+			    bytes > iov->iov[0].iov_len ? iov->iov[0].iov_len : bytes,
+			    offset, nfs_co_generic_cb, &task) != 0) {
+#else
+        task.iov = iov;
         if (nfs_pread_async(client->context, client->fh,
                             offset, bytes, nfs_co_generic_cb, &task) != 0) {
+#endif
             return -ENOMEM;
         }
 
@@ -319,9 +326,15 @@ static int coroutine_fn nfs_co_pwritev(BlockDriverState *bs, int64_t offset,
     }
 
     WITH_QEMU_LOCK_GUARD(&client->mutex) {
+#ifdef LIBNFS_API_V2
+        if (nfs_pwrite_async(client->context, client->fh,
+                             buf, bytes, offset,
+                             nfs_co_generic_cb, &task) != 0) {
+#else
         if (nfs_pwrite_async(client->context, client->fh,
                              offset, bytes, buf,
                              nfs_co_generic_cb, &task) != 0) {
+#endif
             if (my_buffer) {
                 g_free(buf);
             }

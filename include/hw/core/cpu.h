@@ -341,6 +341,7 @@ struct CPUState {
     int thread_id;
     bool running, has_waiter;
     struct QemuCond *halt_cond;
+    volatile int halt_val;
     bool thread_kicked;
     bool created;
     bool stop;
@@ -371,9 +372,13 @@ struct CPUState {
     MemoryRegion *memory;
 
     CPUArchState *env_ptr;
+    void *hamt_kvmcpu_ptr;
     IcountDecr *icount_decr_ptr;
 
     CPUJumpCache *tb_jmp_cache;
+    struct LatxNJC *latx_njc_cache;
+    struct LatxPcidCaches *latx_pcid_caches;
+    Soft_RAS *s_ras;
 
     struct GDBRegisterState *gdb_regs;
     int gdb_num_regs;
@@ -443,6 +448,8 @@ struct CPUState {
 
     /* track IOMMUs whose translations we've cached in the TCG TLB */
     GArray *iommu_notifiers;
+
+    void *curr_exec_tb;
 };
 
 typedef QTAILQ_HEAD(CPUTailQ, CPUState) CPUTailQ;
@@ -464,6 +471,76 @@ extern __thread CPUState *current_cpu;
  */
 extern bool mttcg_enabled;
 #define qemu_tcg_mttcg_enabled() (mttcg_enabled)
+
+extern bool mtcc_enabled;
+#define qemu_tcg_mtcc_enabled() (mtcc_enabled)
+
+extern bool fast_mmu_enabled;
+#define qemu_tcg_fast_mmu_enabled() (fast_mmu_enabled)
+
+#define MTCC_NR         2
+#define curr_mtcc(env)  target_get_curr_mtcc_id(env)
+
+extern bool tcg_exec_mode_1_tcg;
+extern bool tcg_exec_mode_2_lat;
+extern bool tcg_exec_mode_3_mix;
+#define qemu_tcg_mode_1_tcg() (tcg_exec_mode_1_tcg)
+#define qemu_tcg_mode_2_lat() (tcg_exec_mode_2_lat)
+#define qemu_tcg_mode_3_mix() (tcg_exec_mode_3_mix)
+
+extern bool tcg_flush_mode_1_full;
+extern bool tcg_flush_mode_2_fifo;
+#define qemu_tcg_flush_full()   (tcg_flush_mode_1_full)
+#define qemu_tcg_flush_fifo()   (tcg_flush_mode_2_fifo)
+
+extern int tcg_cc_n_regions;
+
+#if !defined(CONFIG_USER_ONLY)
+extern int rrtrace_mode;
+extern int rrtrace_level;
+extern int rrtrace_mask;
+extern FILE *rrtrace_file;
+extern int rrtrace_func;
+extern int rrtrace_config;
+extern uint64_t rrtrace_dump_tb_pc;
+extern int rrtrace_verbose;
+extern uint64_t rrtrace_begin_tbcount;
+extern uint64_t rrtrace_end_tbcount;
+extern uint64_t rrtrace_tbcount_stride;
+extern uint64_t rrtrace_begin_icount;
+extern uint64_t rrtrace_end_icount;
+extern uint64_t rrtrace_icount_stride;
+extern uint64_t rrtrace_icount_save;
+#define qemu_rrtrace_enabled()  (rrtrace_mode != 0)
+#define qemu_rrtrace_noeflags() (rrtrace_config & (0x1 << 0))
+#define qemu_rrtrace_dump_if_tb_pc(pc) (rrtrace_dump_tb_pc == (pc))
+#define qemu_rrtrace_stride_tb(c)   (!((c) % rrtrace_tbcount_stride))
+#define qemu_rrtrace_stride_i_upper(c)  ((c)/rrtrace_icount_stride)
+#define qemu_rrtrace_stride_i_lower(c)  ((c)%rrtrace_icount_stride)
+#define qemu_rrtrace_stride_i(c)    \
+    ((qemu_rrtrace_stride_i_upper(c)) > (rrtrace_icount_save))
+#define qemu_rrtrace_stride_i_update(c)  \
+    (rrtrace_icount_save = (qemu_rrtrace_stride_i_upper(c)))
+#define qemu_rrtrace_verbose_tb_nr(c)   \
+    ((rrtrace_verbose & 0x1) && qemu_rrtrace_stride_tb(c))
+#define qemu_rrtrace_verbose_icount(c)   \
+    ((rrtrace_verbose & 0x2) && qemu_rrtrace_stride_i(c))
+#define qemu_rrtrace_can_begin_tbcount(count) \
+    (((count) > rrtrace_begin_tbcount) && ((count) <= rrtrace_end_tbcount))
+#define qemu_rrtrace_can_begin_icount(icount) \
+    (((icount) > rrtrace_begin_icount) && ((icount) <= rrtrace_end_icount))
+#define qemu_rrtrace_end_exit_tbcount(c)    ((c) > rrtrace_end_tbcount)
+#define qemu_rrtrace_end_exit_icount(c)     ((c) > rrtrace_end_icount)
+#else
+#define qemu_rrtrace_enabled()  (0)
+#define qemu_rrtrace_dump_if_tb_pc(pc) (0)
+#define qemu_rrtrace_stride_tb(c)   (0)
+#define qemu_rrtrace_stride_i(c)    (0)
+#define qemu_rrtrace_verbose_tb_nr()    (0)
+#define qemu_rrtrace_verbose_icount()   (0)
+#define qemu_rrtrace_can_begin_tbcount(count) (0)
+#define qemu_rrtrace_can_begin_icount(icount) (0)
+#endif
 
 /**
  * cpu_paging_enabled:

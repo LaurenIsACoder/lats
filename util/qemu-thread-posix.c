@@ -68,6 +68,7 @@ void qemu_mutex_init(QemuMutex *mutex)
 {
     int err;
 
+	pthread_spin_init (&mutex->spin, PTHREAD_PROCESS_PRIVATE);
     err = pthread_mutex_init(&mutex->lock, NULL);
     if (err)
         error_exit(err, __func__);
@@ -83,6 +84,18 @@ void qemu_mutex_destroy(QemuMutex *mutex)
     err = pthread_mutex_destroy(&mutex->lock);
     if (err)
         error_exit(err, __func__);
+}
+
+void qemu_spin_lock_impl(QemuMutex *mutex, const char *file, const int line)
+{
+    int err;
+
+    assert(mutex->initialized);
+    qemu_mutex_pre_lock(mutex, file, line);
+    err = pthread_mutex_lock(&mutex->lock);
+    if (err)
+        error_exit(err, __func__);
+    qemu_mutex_post_lock(mutex, file, line);
 }
 
 void qemu_mutex_lock_impl(QemuMutex *mutex, const char *file, const int line)
@@ -182,6 +195,9 @@ void qemu_cond_init(QemuCond *cond)
     if (err) {
         error_exit(err, __func__);
     }
+    cond->wait_seq = 1;
+    cond->release_seq = 0;
+    cond->futex_seq = 0;
     cond->initialized = true;
 }
 
@@ -684,3 +700,118 @@ void *qemu_thread_join(QemuThread *thread)
     }
     return ret;
 }
+
+#ifdef CONFIG_LATX_OPT_BQL
+/* Busy-wait tickets and futex wake generations are independent. */
+void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
+{
+    pthread_spin_unlock(&mutex->spin);
+    unsigned long ticket = qatomic_fetch_inc(&cond->wait_seq);
+
+    while (qatomic_read(&cond->release_seq) < ticket) {
+        smp_mb();
+    }
+    pthread_spin_lock(&mutex->spin);
+}
+
+/*
+ * return true : cond is waked up
+ * return false: count reaches max
+ */
+bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, QemuMutex *mutex, int n, bool inc)
+{
+    bool res = false;
+//    pthread_spin_unlock(&mutex->spin);
+    unsigned long ticket = inc ? qatomic_fetch_inc(&cond->wait_seq) :
+                                 qatomic_read(&cond->wait_seq);
+    int count = 0;
+    while (qatomic_read(&cond->release_seq) < ticket && count < n) {
+        smp_mb();
+        count += 1;
+    }
+    if (!(qatomic_read(&cond->release_seq) < ticket)) {
+        res = true;
+    }
+//    pthread_spin_lock(&mutex->spin);
+    return res;
+}
+
+void qemu_cond_broadcast_1(QemuCond *cond)
+{
+    qatomic_set(&cond->release_seq, qatomic_read(&cond->wait_seq));
+    smp_mb();
+}
+
+void qemu_cond_signal_1(QemuCond *cond)
+{
+    qatomic_inc(&cond->release_seq);
+    smp_mb();
+}
+
+void qemu_mutex_lock_1(QemuMutex *mutex)
+{
+    pthread_spin_lock(&mutex->spin);
+}
+
+void qemu_mutex_unlock_1(QemuMutex *mutex)
+{
+    pthread_spin_unlock(&mutex->spin);
+}
+
+#include "qemu/futex.h"
+void qemu_cond_wait_2(QemuCond *cond, QemuMutex *mutex)
+{
+    unsigned int futex_seq = qatomic_read(&cond->futex_seq);
+
+    pthread_spin_unlock(&mutex->spin);
+    qemu_futex_wait(&cond->futex_seq, futex_seq);
+    pthread_spin_lock(&mutex->spin);
+}
+
+void qemu_cond_broadcast_2(QemuCond *cond)
+{
+    qatomic_inc(&cond->futex_seq);
+    qemu_futex_wake(&cond->futex_seq, INT_MAX);
+}
+
+void qemu_cond_signal_2(QemuCond *cond)
+{
+    qatomic_inc(&cond->futex_seq);
+    qemu_futex_wake(&cond->futex_seq, 1);
+}
+
+void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n)
+{
+    pthread_spin_unlock(&mutex->spin);
+    unsigned long ticket = qatomic_fetch_inc(&cond->wait_seq);
+    int count = 0;
+
+    while (qatomic_read(&cond->release_seq) < ticket && count < n) {
+        smp_mb();
+        count += 1;
+    }
+
+    while (qatomic_read(&cond->release_seq) < ticket) {
+        unsigned int futex_seq = qatomic_read(&cond->futex_seq);
+
+        if (!(qatomic_read(&cond->release_seq) < ticket)) {
+            break;
+        }
+        qemu_futex_wait(&cond->futex_seq, futex_seq);
+    }
+    pthread_spin_lock(&mutex->spin);
+}
+
+void qemu_cond_broadcast_3(QemuCond *cond)
+{
+    qemu_cond_broadcast_1(cond);
+    qemu_cond_broadcast_2(cond);
+}
+
+void qemu_cond_signal_3(QemuCond *cond)
+{
+    qemu_cond_signal_1(cond);
+    qemu_cond_signal_2(cond);
+}
+
+#endif

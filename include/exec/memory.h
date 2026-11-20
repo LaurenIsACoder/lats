@@ -310,6 +310,16 @@ struct MemoryRegionOps {
          */
         bool unaligned;
     } impl;
+
+    /*
+     * Return true when this individual access is safe without the BQL.
+     * The callback runs before the BQL is acquired, so it must be
+     * thread-safe, side-effect free, and depend only on immutable device
+     * properties or the access parameters.
+     */
+    bool (*access_lockless)(void *opaque, hwaddr addr,
+                            unsigned size, bool is_write,
+                            MemTxAttrs attrs);
 };
 
 typedef struct MemoryRegionClass {
@@ -799,6 +809,14 @@ struct MemoryRegion {
 
     /* For devices designed to perform re-entrant IO into their own IO MRs */
     bool disable_reentrancy_guard;
+
+    /*
+     * For devices that handle their own concurrency and do not need the
+     * BQL (iothread lock) taken around MMIO dispatch.  Must be set before
+     * the region is exposed to vCPUs (e.g. in device init/realize) and
+     * never changed afterwards.
+     */
+    bool disable_locking;
 };
 
 struct IOMMUMemoryRegion {
@@ -1287,6 +1305,15 @@ void memory_region_init_ram_flags_nomigrate(MemoryRegion *mr,
                                             uint32_t ram_flags,
                                             Error **errp);
 
+void memory_region_init_ram_flags_nomigrate_from_base(MemoryRegion *mr,
+                                                      Object *owner,
+                                                      const char *name,
+                                                      uint64_t size,
+                                                      uint32_t ram_flags,
+                                                      void *base,
+                                                      Error **errp);
+
+
 /**
  * memory_region_init_resizeable_ram:  Initialize memory region with resizable
  *                                     RAM.  Accesses into the region will
@@ -1351,6 +1378,17 @@ void memory_region_init_ram_from_file(MemoryRegion *mr,
                                       bool readonly,
                                       Error **errp);
 
+void memory_region_init_ram_from_file_from_base(MemoryRegion *mr,
+                                      Object *owner,
+                                      const char *name,
+                                      uint64_t size,
+                                      uint64_t align,
+                                      uint32_t ram_flags,
+                                      const char *path,
+                                      ram_addr_t offset,
+                                      bool readonly,
+                                      void *base,
+                                      Error **errp);
 /**
  * memory_region_init_ram_from_fd:  Initialize RAM memory region with a
  *                                  mmap-ed backend.
@@ -1376,6 +1414,15 @@ void memory_region_init_ram_from_fd(MemoryRegion *mr,
                                     int fd,
                                     ram_addr_t offset,
                                     Error **errp);
+void memory_region_init_ram_from_fd_from_base(MemoryRegion *mr,
+                                              Object *owner,
+                                              const char *name,
+                                              uint64_t size,
+                                              uint32_t ram_flags,
+                                              int fd,
+                                              ram_addr_t offset,
+                                              void *base,
+                                              Error **errp);
 #endif
 
 /**
@@ -2107,6 +2154,19 @@ void memory_region_flush_rom_device(MemoryRegion *mr, hwaddr addr, hwaddr size);
 void memory_region_set_readonly(MemoryRegion *mr, bool readonly);
 
 /**
+ * memory_region_disable_locking: Allow lockless MMIO dispatch
+ *
+ * Marks a memory region whose device handles its own concurrency, so the
+ * MMIO slow path may dispatch to it without holding the BQL (iothread
+ * lock).  Only valid for devices whose MemoryRegionOps callbacks are safe
+ * to run concurrently from any vCPU thread and without the BQL.
+ * Must be called before the region is exposed to vCPUs and never undone.
+ *
+ * @mr: the region being updated.
+ */
+void memory_region_disable_locking(MemoryRegion *mr);
+
+/**
  * memory_region_set_nonvolatile: Turn a memory region non-volatile
  *
  * Allows a memory region to be marked as non-volatile.
@@ -2495,7 +2555,8 @@ void memory_global_dirty_log_start(unsigned int flags);
  */
 void memory_global_dirty_log_stop(unsigned int flags);
 
-void mtree_info(bool flatview, bool dispatch_tree, bool owner, bool disabled);
+void mtree_info(bool flatview, bool dispatch_tree, bool owner, bool disabled,
+        bool ramblock);
 
 bool memory_region_access_valid(MemoryRegion *mr, hwaddr addr,
                                 unsigned size, bool is_write,
@@ -2877,7 +2938,8 @@ MemTxResult address_space_write_cached_slow(MemoryRegionCache *cache,
                                             hwaddr len);
 
 int memory_access_size(MemoryRegion *mr, unsigned l, hwaddr addr);
-bool prepare_mmio_access(MemoryRegion *mr);
+bool prepare_mmio_access(MemoryRegion *mr, hwaddr addr, unsigned size,
+                         bool is_write, MemTxAttrs attrs);
 
 static inline bool memory_access_is_direct(MemoryRegion *mr, bool is_write)
 {

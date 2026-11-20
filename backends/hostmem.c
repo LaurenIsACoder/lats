@@ -20,6 +20,8 @@
 #include "qom/object_interfaces.h"
 #include "qemu/mmap-alloc.h"
 #include "qemu/madvise.h"
+#include "hamt-hostmem.h"
+#include "latx-hack.h"
 
 #ifdef CONFIG_NUMA
 #include <numaif.h>
@@ -299,7 +301,12 @@ bool host_memory_backend_mr_inited(HostMemoryBackend *backend)
 
 MemoryRegion *host_memory_backend_get_memory(HostMemoryBackend *backend)
 {
-    return host_memory_backend_mr_inited(backend) ? &backend->mr : NULL;
+    if (!host_memory_backend_mr_inited(backend) &&
+        !host_memory_backend_prepare(backend, LATX_BACKEND_DEVICE_RAM,
+                                     0, &error_fatal)) {
+        return NULL;
+    }
+    return &backend->mr;
 }
 
 void host_memory_backend_set_mapped(HostMemoryBackend *backend, bool mapped)
@@ -319,11 +326,24 @@ size_t host_memory_backend_pagesize(HostMemoryBackend *memdev)
     return pagesize;
 }
 
-static void
-host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
+uint64_t latx_memory_backend_size;
+
+uint64_t host_memory_backend_alloc_size(HostMemoryBackend *backend)
 {
-    HostMemoryBackend *backend = MEMORY_BACKEND(uc);
-    HostMemoryBackendClass *bc = MEMORY_BACKEND_GET_CLASS(uc);
+    uint64_t size = backend->size;
+
+#ifdef CONFIG_LATX_HACK_MEM
+    if (backend->latx_role == LATX_BACKEND_GUEST_RAM) {
+        size += latx_hack_mem_backend_extra_size();
+    }
+#endif
+    return size;
+}
+
+static void
+host_memory_backend_memory_prepare(HostMemoryBackend *backend, Error **errp)
+{
+    HostMemoryBackendClass *bc = MEMORY_BACKEND_GET_CLASS(backend);
     Error *local_err = NULL;
     void *ptr;
     uint64_t sz;
@@ -336,6 +356,17 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
 
         ptr = memory_region_get_ram_ptr(&backend->mr);
         sz = memory_region_size(&backend->mr);
+        backend->alloc_size = sz;
+        if (backend->latx_role == LATX_BACKEND_GUEST_RAM &&
+            sz > latx_memory_backend_size) {
+            latx_memory_backend_size = sz;
+            hamt_realloc_ptwdata(sz);
+        }
+
+#if defined(CONFIG_LATX_PRINT)
+        printf("%s ptr  %p\n",  __func__, ptr);
+        printf("%s size %lx\n", __func__, sz);
+#endif
 
         if (backend->merge) {
             qemu_madvise(ptr, sz, QEMU_MADV_MERGEABLE);
@@ -409,6 +440,46 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
     }
 out:
     error_propagate(errp, local_err);
+}
+bool host_memory_backend_prepare(HostMemoryBackend *backend,
+                                 LatxBackendRole role,
+                                 uint64_t guest_start,
+                                 Error **errp)
+{
+    Error *local_err = NULL;
+
+    if (role == LATX_BACKEND_NONE) {
+        error_setg(errp, "memory backend role must be specified");
+        return false;
+    }
+    if (backend->latx_role != LATX_BACKEND_NONE &&
+        backend->latx_role != role) {
+        error_setg(errp, "memory backend %s has incompatible roles",
+                   object_get_canonical_path_component(OBJECT(backend)));
+        return false;
+    }
+
+    backend->latx_role = role;
+    backend->latx_guest_start = guest_start;
+    if (!host_memory_backend_mr_inited(backend)) {
+        host_memory_backend_memory_prepare(backend, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
+{
+    HostMemoryBackend *backend = MEMORY_BACKEND(uc);
+
+    if (backend->latx_role != LATX_BACKEND_NONE) {
+        host_memory_backend_prepare(backend, backend->latx_role,
+                                    backend->latx_guest_start, errp);
+    }
 }
 
 static bool

@@ -23,5 +23,7 @@ bool qsp_is_enabled(void);
 void qsp_enable(void);
 void qsp_disable(void);
 void qsp_reset(void);
+void qsp_record_mmio_bql(const void *mr, const char *name, uint64_t offset,
+                         bool is_write, int64_t wait_ns);
 
 #endif /* QEMU_QSP_H */

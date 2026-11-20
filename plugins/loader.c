@@ -74,7 +74,7 @@ void qemu_plugin_add_dyn_cb_arr(GArray *arr)
     uint32_t hash = qemu_xxhash2((uint64_t)(uintptr_t)arr);
     bool inserted;
 
-    inserted = qht_insert(&plugin.dyn_cb_arr_ht, arr, hash, NULL);
+    inserted = qht_insert(&plugin.dyn_cb_arr_ht, arr, hash, NULL, NULL);
     g_assert(inserted);
 }
 

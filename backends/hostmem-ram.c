@@ -16,10 +16,13 @@
 #include "qemu/module.h"
 #include "qom/object_interfaces.h"
 
+#include "latx-hack.h"
+
 static void
 ram_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
 {
     uint32_t ram_flags;
+    uint64_t alloc_size;
     char *name;
 
     if (!backend->size) {
@@ -28,10 +31,21 @@ ram_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
     }
 
     name = host_memory_backend_get_name(backend);
+    alloc_size = host_memory_backend_alloc_size(backend);
     ram_flags = backend->share ? RAM_SHARED : 0;
     ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
+#ifdef CONFIG_LATX_HACK_MEM
+    if (backend->latx_role == LATX_BACKEND_GUEST_RAM) {
+        void *base = (void *)HACK_RAMBASE;
+
+        memory_region_init_ram_flags_nomigrate_from_base(&backend->mr,
+                    OBJECT(backend), name, alloc_size, ram_flags, base, errp);
+        g_free(name);
+        return;
+    }
+#endif
     memory_region_init_ram_flags_nomigrate(&backend->mr, OBJECT(backend), name,
-                                           backend->size, ram_flags, errp);
+                                           alloc_size, ram_flags, errp);
     g_free(name);
 }
 

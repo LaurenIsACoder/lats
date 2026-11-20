@@ -75,6 +75,8 @@ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length);
 /* This should not be used by devices.  */
 ram_addr_t qemu_ram_addr_from_host(void *ptr);
 ram_addr_t qemu_ram_addr_from_host_nofail(void *ptr);
+uint64_t qemu_ram_addr_to_gpa(ram_addr_t ramaddr);
+void *qemu_ram_addr_to_host(ram_addr_t ramaddr);
 RAMBlock *qemu_ram_block_by_name(const char *name);
 RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
                                    ram_addr_t *offset);
@@ -165,5 +167,7 @@ int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
 
 /* vl.c */
 void list_cpus(void);
+
+extern __thread CPUState *offline_cpu;
 
 #endif /* CPU_COMMON_H */

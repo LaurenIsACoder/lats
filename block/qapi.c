@@ -799,7 +799,7 @@ void bdrv_snapshot_dump(QEMUSnapshotInfo *sn)
             snprintf(icount_buf, sizeof(icount_buf),
                 "%"PRId64, sn->icount);
         }
-        qemu_printf("%-9s %-16s %8s%20s%13s%11s",
+        qemu_printf("%-9s %-16s %8s %20s %13s %11s",
                     sn->id_str, sn->name,
                     sizing,
                     date_buf,

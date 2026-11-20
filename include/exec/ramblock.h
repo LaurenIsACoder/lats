@@ -75,6 +75,9 @@ struct RAMBlock {
      * could not have been valid on the source.
      */
     ram_addr_t postcopy_length;
+
+    int alloc_from_base;
+    void *base;
 };
 #endif
 #endif

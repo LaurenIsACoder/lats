@@ -19,6 +19,8 @@
 #include "qom/object_interfaces.h"
 #include "qom/object.h"
 
+#include "latx-hack.h"
+
 OBJECT_DECLARE_SIMPLE_TYPE(HostMemoryBackendFile, MEMORY_BACKEND_FILE)
 
 
@@ -42,6 +44,7 @@ file_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
 #else
     HostMemoryBackendFile *fb = MEMORY_BACKEND_FILE(backend);
     uint32_t ram_flags;
+    uint64_t alloc_size;
     gchar *name;
 
     if (!backend->size) {
@@ -54,12 +57,25 @@ file_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
     }
 
     name = host_memory_backend_get_name(backend);
+    alloc_size = host_memory_backend_alloc_size(backend);
     ram_flags = backend->share ? RAM_SHARED : 0;
     ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
     ram_flags |= fb->is_pmem ? RAM_PMEM : 0;
     ram_flags |= RAM_NAMED_FILE;
+#ifdef CONFIG_LATX_HACK_MEM
+    if (backend->latx_role == LATX_BACKEND_GUEST_RAM) {
+        void *base = (void *)HACK_RAMBASE;
+
+        memory_region_init_ram_from_file_from_base(&backend->mr,
+                                     OBJECT(backend), name, alloc_size,
+                                     fb->align, ram_flags, fb->mem_path,
+                                     fb->offset, fb->readonly, base, errp);
+        g_free(name);
+        return;
+    }
+#endif
     memory_region_init_ram_from_file(&backend->mr, OBJECT(backend), name,
-                                     backend->size, fb->align, ram_flags,
+                                     alloc_size, fb->align, ram_flags,
                                      fb->mem_path, fb->offset, fb->readonly,
                                      errp);
     g_free(name);

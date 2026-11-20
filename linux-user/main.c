@@ -55,6 +55,8 @@
 #include "loader.h"
 #include "user-mmap.h"
 #include "accel/tcg/perf.h"
+#include "latx/offline/latx_offline_mode.h"
+#include "latx/aot-verify-mode.h"
 
 #ifdef CONFIG_SEMIHOSTING
 #include "semihosting/semihost.h"
@@ -64,6 +66,16 @@
 #define AT_FLAGS_PRESERVE_ARGV0_BIT 0
 #define AT_FLAGS_PRESERVE_ARGV0 (1 << AT_FLAGS_PRESERVE_ARGV0_BIT)
 #endif
+
+#include "latx-config.h"
+extern QemuOptsList qemu_latx_opts;
+void latx_parse_options(QemuOpts *opts);
+static void handle_latx(const char *optarg)
+{
+    QemuOpts *opts = qemu_opts_parse_noisily(qemu_find_opts("latx"),
+            optarg, true);
+    latx_parse_options(opts);
+}
 
 char *exec_path;
 char real_exec_path[PATH_MAX];
@@ -476,6 +488,8 @@ static const struct qemu_argument arg_table[] = {
      "size",       "set the stack size to 'size' bytes"},
     {"cpu",        "QEMU_CPU",         true,  handle_arg_cpu,
      "model",      "select CPU (-cpu help for list)"},
+    {"latx",       "QEMU_LATX",         true,  handle_latx,
+     "",           "latx options)"},
     {"E",          "QEMU_SET_ENV",     true,  handle_arg_set_env,
      "var=value",  "sets targets environment variable (see below)"},
     {"U",          "QEMU_UNSET_ENV",   true,  handle_arg_unset_env,
@@ -718,10 +732,24 @@ int main(int argc, char **argv, char **envp)
     }
 
     cpu_model = NULL;
+    cpu_model = "qemu64";
 
     qemu_add_opts(&qemu_trace_opts);
+    qemu_add_opts(&qemu_latx_opts);
     qemu_plugin_add_opts();
 
+    /* Check for offline disassembly mode */
+    int offline_idx = check_offline_mode(argc, argv);
+    if (offline_idx) {
+        return run_offline_mode(argc, argv, offline_idx);
+    }
+
+    {
+        int aot_verify_idx = check_aot_verify_mode(argc, argv);
+        if (aot_verify_idx) {
+            return run_aot_verify_mode(argc, argv, aot_verify_idx);
+        }
+    }
     optind = parse_args(argc, argv);
 
     qemu_set_log_filename_flags(last_log_filename,
@@ -1011,6 +1039,7 @@ int main(int argc, char **argv, char **envp)
     qemu_semihosting_guestfd_init();
 #endif
 
+    latx_lsenv_init(env);
     cpu_loop(env);
     /* never exits */
     return 0;

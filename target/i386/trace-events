@@ -11,3 +11,6 @@ kvm_sev_launch_measurement(const char *value) "data %s"
 kvm_sev_launch_finish(void) ""
 kvm_sev_launch_secret(uint64_t hpa, uint64_t hva, uint64_t secret, int len) "hpa 0x%" PRIx64 " hva 0x%" PRIx64 " data 0x%" PRIx64 " len %d"
 kvm_sev_attestation_report(const char *mnonce, const char *data) "mnonce %s data %s"
+
+# Privileged PCID transitions (source RIP from the LATX instruction boundary).
+x86_pcid_cr3(int cpu, uint64_t rip, uint64_t old, uint64_t cr3, bool noflush) "cpu=%d rip=0x%"PRIx64" old=0x%"PRIx64" cr3=0x%"PRIx64" noflush=%d"

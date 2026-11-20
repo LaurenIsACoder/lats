@@ -36,6 +36,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/i386/topology.h"
 #ifndef CONFIG_USER_ONLY
+#include "exec/tb-flush.h"
 #include "qapi/qapi-commands-machine-target.h"
 #include "exec/address-spaces.h"
 #include "hw/boards.h"
@@ -44,6 +45,9 @@
 
 #include "disas/capstone.h"
 #include "cpu-internal.h"
+#include "latx/include/latx-sys-env-init-func.h"
+#include "latx/include/latx-options.h"
+#include "hamt-dmw.h"
 
 static void x86_cpu_realizefn(DeviceState *dev, Error **errp);
 
@@ -713,7 +717,7 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
           CPUID_7_0_EBX_PCOMMIT | CPUID_7_0_EBX_CLFLUSHOPT |            \
           CPUID_7_0_EBX_CLWB | CPUID_7_0_EBX_MPX | CPUID_7_0_EBX_FSGSBASE | \
           CPUID_7_0_EBX_ERMS | CPUID_7_0_EBX_AVX2 | CPUID_7_0_EBX_RDSEED | \
-          CPUID_7_0_EBX_KERNEL_FEATURES)
+          CPUID_7_0_EBX_SHA_NI | CPUID_7_0_EBX_KERNEL_FEATURES)
           /* missing:
           CPUID_7_0_EBX_HLE
           CPUID_7_0_EBX_INVPCID, CPUID_7_0_EBX_RTM */
@@ -2196,13 +2200,16 @@ static const X86CPUDefinition builtin_x86_defs[] = {
             CPUID_MTRR | CPUID_CLFLUSH | CPUID_MCA |
             CPUID_PSE36,
         .features[FEAT_1_ECX] =
-            CPUID_EXT_SSE3 | CPUID_EXT_CX16,
+            CPUID_EXT_AES | CPUID_EXT_POPCNT | CPUID_EXT_SSE42 |
+            CPUID_EXT_SSE41 | CPUID_EXT_CX16 | CPUID_EXT_SSSE3 |
+            CPUID_EXT_PCLMULQDQ | CPUID_EXT_SSE3 | CPUID_EXT_MOVBE,
         .features[FEAT_8000_0001_EDX] =
             CPUID_EXT2_LM | CPUID_EXT2_SYSCALL | CPUID_EXT2_NX,
         .features[FEAT_8000_0001_ECX] =
             CPUID_EXT3_LAHF_LM | CPUID_EXT3_SVM,
         .xlevel = 0x8000000A,
-        .model_id = "QEMU Virtual CPU version " QEMU_HW_VERSION,
+        //.model_id = "QEMU Virtual CPU version " QEMU_HW_VERSION,
+        .model_id = "LoongArch Virtual CPU",
     },
     {
         .name = "phenom",
@@ -2661,7 +2668,7 @@ static const X86CPUDefinition builtin_x86_defs[] = {
         .features[FEAT_1_ECX] =
             CPUID_EXT_AES | CPUID_EXT_POPCNT | CPUID_EXT_SSE42 |
             CPUID_EXT_SSE41 | CPUID_EXT_CX16 | CPUID_EXT_SSSE3 |
-            CPUID_EXT_PCLMULQDQ | CPUID_EXT_SSE3,
+            CPUID_EXT_PCLMULQDQ | CPUID_EXT_SSE3 | CPUID_EXT_MOVBE,
         .features[FEAT_8000_0001_EDX] =
             CPUID_EXT2_LM | CPUID_EXT2_SYSCALL | CPUID_EXT2_NX,
         .features[FEAT_8000_0001_ECX] =
@@ -5702,6 +5709,15 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
                                     wi->cpuid.reg);
     } else if (tcg_enabled()) {
         r = wi->tcg_features;
+#if defined(CONFIG_SOFTMMU) && defined(TARGET_X86_64)
+        if (option_pcid) {
+            if (w == FEAT_1_ECX) {
+                r |= CPUID_EXT_PCID;
+            } else if (w == FEAT_7_0_EBX) {
+                r |= CPUID_7_0_EBX_INVPCID;
+            }
+        }
+#endif
     } else {
         return ~0;
     }
@@ -6462,7 +6478,7 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
          * set here, but we restrict to TCG none the less.
          */
         if (tcg_enabled() && cpu->expose_tcg) {
-            memcpy(signature, "TCGTCGTCGTCG", 12);
+            memcpy(signature, "LATXLATXLATX", 12);
             *eax = 0x40000001;
             *ebx = signature[0];
             *ecx = signature[1];
@@ -6697,9 +6713,26 @@ static void x86_cpu_reset_hold(Object *obj)
         xcc->parent_phases.hold(obj);
     }
 
+#ifndef CONFIG_USER_ONLY
+    /*
+     * Guest reboot rewrites kernel text during decompression. Drop old
+     * translations up front instead of invalidating them page by page.
+     */
+    if (option_tb_flush_on_reboot && tcg_enabled() &&
+        qemu_tcg_flush_full() && s->cpu_index == 0) {
+        tb_flush(s);
+    }
+#endif
+
+    g_free((void *)(uintptr_t)DMW_OUT(env->tu_generation_array));
+    env->tu_generation_array = NULL;
     memset(env, 0, offsetof(CPUX86State, end_reset_fields));
+#ifndef CONFIG_USER_ONLY
+    latx_pcid_cache_reset(s);
+#endif
 
     env->old_exception = -1;
+    env->hamt_guest_asid = 0xf;
 
     /* init to reset state */
     env->int_ctl = 0;
@@ -6742,6 +6775,7 @@ static void x86_cpu_reset_hold(Object *obj)
     env->regs[R_EDX] = env->cpuid_version;
 
     env->eflags = 0x2;
+    env->df = 1 - (2 * ((env->eflags >> 10) & 1));
 
     /* FPU init */
     for (i = 0; i < 8; i++) {
@@ -6750,6 +6784,7 @@ static void x86_cpu_reset_hold(Object *obj)
     cpu_set_fpuc(env, 0x37f);
 
     env->mxcsr = 0x1f80;
+    env->old_mxcsr = UINT32_MAX;
     /* All units are in INIT state.  */
     env->xstate_bv = 0;
 
@@ -6840,6 +6875,9 @@ static void x86_cpu_reset_hold(Object *obj)
     env->amd_tsc_scale_msr =  MSR_AMD64_TSC_RATIO_DEFAULT;
 
 #endif
+    if (qemu_tcg_mode_2_lat()) {
+        latx_lsenv_init(env);
+    }
 }
 
 void x86_cpu_after_reset(X86CPU *cpu)
@@ -6990,6 +7028,19 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     FeatureWord w;
     int i;
     GList *l;
+
+#if defined(CONFIG_SOFTMMU) && defined(TARGET_X86_64)
+    X86CPUClass *xcc = X86_CPU_GET_CLASS(cpu);
+
+    if (tcg_enabled() && option_pcid && xcc->model &&
+        xcc->model->cpudef &&
+        !strcmp(xcc->model->cpudef->name, "qemu64")) {
+        env->features[FEAT_1_ECX] |= CPUID_EXT_PCID &
+                                     ~env->user_features[FEAT_1_ECX];
+        env->features[FEAT_7_0_EBX] |= CPUID_7_0_EBX_INVPCID &
+                                       ~env->user_features[FEAT_7_0_EBX];
+    }
+#endif
 
     for (l = plus_features; l; l = l->next) {
         const char *prop = l->data;
@@ -7218,7 +7269,9 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
 
     /* Use pc-relative instructions in system-mode */
 #ifndef CONFIG_USER_ONLY
+#ifdef CONFIG_PCREL
     cs->tcg_cflags |= CF_PCREL;
+#endif
 #endif
 
     if (cpu->apic_id == UNASSIGNED_APIC_ID) {
@@ -7476,6 +7529,9 @@ static void x86_cpu_unrealizefn(DeviceState *dev)
         object_unparent(OBJECT(cpu->apic_state));
         cpu->apic_state = NULL;
     }
+
+    g_free((void *)(uintptr_t)DMW_OUT(cpu->env.tu_generation_array));
+    cpu->env.tu_generation_array = NULL;
 
     xcc->parent_unrealize(dev);
 }
@@ -7773,6 +7829,7 @@ void x86_update_hflags(CPUX86State *env)
         }
     }
     env->hflags = hflags;
+    update_hamt_en(env);
 }
 
 static Property x86_cpu_properties[] = {
@@ -8012,6 +8069,14 @@ static void x86_cpu_common_class_init(ObjectClass *oc, void *data)
             x86_cpu_register_feature_bit_props(xcc, w, bitnr);
         }
     }
+}
+
+void cpu_arch_state_set_vram(CPUArchState *env, uint64_t b, uint64_t s);
+void cpu_arch_state_set_vram(CPUArchState *env, uint64_t b, uint64_t s)
+{
+    env->vram_base = b;
+    env->vram_size = s;
+    asm volatile ("\tdbar 0\n"::);
 }
 
 static const TypeInfo x86_cpu_type_info = {

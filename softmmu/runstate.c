@@ -60,6 +60,9 @@
 #include "sysemu/sysemu.h"
 #include "sysemu/tpm.h"
 #include "trace.h"
+#ifdef CONFIG_LATX_OPT
+#include "sysemu/latx-aot.h"
+#endif
 
 static NotifierList exit_notifiers =
     NOTIFIER_LIST_INITIALIZER(exit_notifiers);
@@ -805,6 +808,10 @@ void qemu_cleanup(void)
 
     /* No more vcpu or device emulation activity beyond this point */
     vm_shutdown();
+#ifdef CONFIG_LATX_OPT
+    /* Snapshot stopped vCPUs before RAM and translation resources disappear. */
+    aot_shutdown();
+#endif
     replay_finish();
 
     /*

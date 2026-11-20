@@ -126,6 +126,14 @@ void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr);
  * use one of the other functions for efficiency.
  */
 void tlb_flush(CPUState *cpu);
+void tlb_flush_after_pcid_switch(CPUState *cpu);
+bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain);
+void latx_pcid_cache_init(CPUState *cpu);
+void latx_pcid_cache_destroy(CPUState *cpu);
+void latx_pcid_cache_reset(CPUState *cpu);
+void latx_pcid_jump_invalidate(CPUState *cpu, vaddr pc, TranslationBlock *tb);
+void latx_pcid_jump_flush(CPUState *cpu);
+void latx_pcid_jump_flush_page(CPUState *cpu, vaddr pc);
 /**
  * tlb_flush_all_cpus:
  * @cpu: src CPU of the flush
@@ -465,6 +473,8 @@ int probe_access_full(CPUArchState *env, vaddr addr, int size,
                       bool nonfault, void **phost,
                       CPUTLBEntryFull **pfull, uintptr_t retaddr);
 
+bool latx_fast_gpa_to_hva(CPUX86State *env,
+                          uint64_t gpa, uint64_t *hva);
 /**
  * probe_access_mmu() - Like probe_access_full except cannot fault and
  * doesn't trigger instrumentation.
@@ -487,6 +497,20 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
                           MMUAccessType access_type, int mmu_idx,
                           void **phost, CPUTLBEntryFull **pfull);
 
+#endif
+#ifdef CONFIG_LATX_TU
+typedef enum IR1_TYPE {
+    IR1_TYPE_NORMAL = 0,
+    IR1_TYPE_BRANCH,
+    IR1_TYPE_JUMP,
+    IR1_TYPE_CALL,
+    IR1_TYPE_RET,
+    IR1_TYPE_JUMPIN,
+    IR1_TYPE_CALLIN,
+    IR1_TYPE_SYSCALL,
+    IR1_TYPE_EOB,
+    IR1_TYPE_SPLITED,
+} IR1_TYPE;
 #endif
 
 /* Hide the qatomic_read to make code a little easier on the eyes */
@@ -530,6 +554,9 @@ static inline void tb_set_page_addr0(TranslationBlock *tb,
     tb->itree.last = addr;
 #else
     tb->page_addr[0] = addr;
+
+    tb->page_addr_mix = (addr == -1ULL) ? 0 :
+        tb_cal_page_addr_mix(tb->pc, addr);
 #endif
 }
 
@@ -541,6 +568,7 @@ static inline void tb_set_page_addr1(TranslationBlock *tb,
     tb->itree.last = addr;
 #else
     tb->page_addr[1] = addr;
+
 #endif
 }
 
@@ -556,14 +584,23 @@ void tb_invalidate_phys_addr(AddressSpace *as, hwaddr addr, MemTxAttrs attrs);
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
 void tb_invalidate_phys_range(tb_page_addr_t start, tb_page_addr_t last);
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
+#ifdef CONFIG_LATX_TU
+TranslationBlock *tb_htable_lookup(CPUState *cpu, vaddr pc,
+                                          uint64_t cs_base, uint32_t flags,
+                                          uint32_t cflags);
+#endif
+TranslationBlock *tb_htable_lookup_noexit(CPUState *cpu, vaddr pc,
+        uint64_t cs_base, uint32_t flags, uint32_t cflags);
 
 /* GETPC is the true target of the return instruction that we'll execute.  */
 #if defined(CONFIG_TCG_INTERPRETER)
 extern __thread uintptr_t tci_tb_ptr;
 # define GETPC() tci_tb_ptr
 #else
-# define GETPC() \
+#include "hamt-dmw.h"
+# define NATIVE_GETPC() \
     ((uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)))
+# define GETPC() ((uintptr_t)(DMW_OUT(NATIVE_GETPC())))
 #endif
 
 /* The true return address will often point to a host insn that is part of
@@ -606,6 +643,9 @@ struct MemoryRegionSection *iotlb_to_section(CPUState *cpu,
  */
 tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
                                         void **hostp);
+tb_page_addr_t get_page_addr_code_hostp_noexit(CPUArchState *env, vaddr addr,
+                                        void **hostp);
+bool tlb_rw_check(CPUArchState *env, MMUAccessType access_type, vaddr addr);
 
 /**
  * get_page_addr_code()
@@ -622,6 +662,11 @@ static inline tb_page_addr_t get_page_addr_code(CPUArchState *env,
                                                 vaddr addr)
 {
     return get_page_addr_code_hostp(env, addr, NULL);
+}
+static inline tb_page_addr_t get_page_addr_code_noexit(CPUArchState *env,
+                                                vaddr addr)
+{
+    return get_page_addr_code_hostp_noexit(env, addr, NULL);
 }
 
 #if defined(CONFIG_USER_ONLY)

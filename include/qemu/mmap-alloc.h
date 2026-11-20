@@ -38,6 +38,12 @@ void *qemu_ram_mmap(int fd,
                     uint32_t qemu_map_flags,
                     off_t map_offset);
 
+void *qemu_ram_mmap_base(int fd,
+                    size_t size,
+                    size_t align,
+                    uint32_t qemu_map_flags,
+                    off_t map_offset, void *base);
+
 void qemu_ram_munmap(int fd, void *ptr, size_t size);
 
 /*

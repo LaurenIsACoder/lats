@@ -29,5 +29,14 @@ void AES_decrypt(const unsigned char *in, unsigned char *out,
 
 extern const uint8_t AES_sbox[256];
 extern const uint8_t AES_isbox[256];
+extern const uint32_t AES_Td0[256];
+extern const uint32_t AES_Td1[256];
+extern const uint32_t AES_Td2[256];
+extern const uint32_t AES_Td3[256];
+extern const uint32_t AES_Te0[256];
+extern const uint32_t AES_Te1[256];
+extern const uint32_t AES_Te2[256];
+extern const uint32_t AES_Te3[256];
+extern const uint32_t AES_imc_rot[256];
 
 #endif

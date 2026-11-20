@@ -77,7 +77,7 @@ endif
 subdir('decode')
 
 if 'CONFIG_TCG' in config_all
-  subdir('fp')
+#  subdir('fp')
 endif
 
 if get_option('tcg').allowed()

@@ -132,6 +132,14 @@ extern void rcu_unregister_thread(void);
 extern void rcu_enable_atfork(void);
 extern void rcu_disable_atfork(void);
 
+#ifdef CONFIG_POSIX
+/*
+ * Fork a private snapshot, discarding inherited deferred frees in the child.
+ * The caller must hold BQL and be outside an RCU read-side section.
+ */
+pid_t rcu_fork_snapshot(void);
+#endif
+
 struct rcu_head;
 typedef void RCUCBFunc(struct rcu_head *head);
 

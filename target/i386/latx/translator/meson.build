@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2024-2026 LATS Project Authors
+#
+# SPDX-License-Identifier: GPL-2.0-only
+
+i386_ss.add(files(
+  'reg-alloc.c',
+  'translate.c',
+  'tr-eflag-process.c',
+  'sys-opnd-process.c',
+  'sys-translate.c',
+  'sys-eflags.c',
+  'sys-disasm.c',
+  'sys-static-codes.c',
+  'sys-smc-check.c',
+  'sys.c',
+  'sys-eob.c',
+  'sys-softmmu.c',
+  'sys-helper.c',
+  'sys-excp.c',
+  'sys-tr-instptn.c',
+  'sys-tr-misc.c',
+  'sys-tr-adcx.c',
+  'sys-tr-bmi.c',
+  'sys-tr-arith.c',
+  'sys-tr-branch.c',
+  'sys-tr-logic.c',
+  'sys-tr-mov.c',
+  'sys-tr-io.c',
+  'sys-tr-setcc.c',
+  'sys-tr-string.c',
+  'sys-tr-fp.c',
+  'sys-tr-fctrl.c',
+  'sys-tr-farith.c',
+  'sys-tr-fldst.c',
+  'sys-tr-fcmovcc.c',
+  'sys-tr-simd.c',
+  'sys-tr-simd-cmp.c',
+  'sys-tr-ssse3.c',
+  'sys-tr-sse41.c',
+  'sys-tr-sse42.c',
+  'sys-devel.c',
+  'sys-fpu.c',
+  'sys-tr-softfpu.c',
+  'sys-tr-byhand64.c',
+  'sys-tr-lock.c'
+))
+
+i386_system_ss.add(files(
+  'sys-cvt-addr.c'
+))

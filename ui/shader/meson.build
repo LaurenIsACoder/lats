@@ -2,6 +2,9 @@ shaders = [
   ['texture-blit', 'frag'],
   ['texture-blit', 'vert'],
   ['texture-blit-flip', 'vert'],
+  ['texture-blit-old', 'frag'],
+  ['texture-blit-old', 'vert'],
+  ['texture-blit-flip-old', 'vert'],
 ]
 
 foreach e : shaders

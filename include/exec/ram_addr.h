@@ -28,6 +28,25 @@
 
 extern uint64_t total_dirty_pages;
 
+extern uint64_t vram_base;
+extern uint64_t vram_size;
+static inline bool paddr_in_vram(hwaddr paddr)
+{
+    return (paddr >= vram_base && paddr < vram_base + vram_size);
+}
+
+extern uint64_t latx_memory_backend_size;
+#ifdef CONFIG_LATX_HACK_MEM
+#include "latx-hack.h"
+static inline bool latx_hack_gpa_in_ram(hwaddr paddr)
+{
+    return (paddr >= 0x100000 && paddr < latx_hack_ram_below_4g_end) ||
+           (paddr >= latx_hack_ram_above_4g_start &&
+            paddr < latx_hack_ram_above_4g_end) ||
+           paddr_in_vram(paddr);
+}
+#endif
+
 /**
  * clear_bmap_size: calculate clear bitmap size
  *
@@ -77,7 +96,11 @@ static inline bool clear_bmap_test_and_clear(RAMBlock *rb, uint64_t page)
 
 static inline bool offset_in_ramblock(RAMBlock *b, ram_addr_t offset)
 {
-    return (b && b->host && offset < b->used_length) ? true : false;
+    if (b->alloc_from_base && b->base == NULL) {
+        return (b && offset < b->used_length) ? true : false;
+    } else {
+        return (b && b->host && offset < b->used_length) ? true : false;
+    }
 }
 
 static inline void *ramblock_ptr(RAMBlock *block, ram_addr_t offset)
@@ -124,11 +147,19 @@ RAMBlock *qemu_ram_alloc_from_file(ram_addr_t size, MemoryRegion *mr,
 RAMBlock *qemu_ram_alloc_from_fd(ram_addr_t size, MemoryRegion *mr,
                                  uint32_t ram_flags, int fd, off_t offset,
                                  bool readonly, Error **errp);
+RAMBlock *qemu_ram_alloc_from_file_from_base(ram_addr_t size, MemoryRegion *mr,
+                                   uint32_t ram_flags, const char *mem_path,
+                                   off_t offset, bool readonly, void *base, Error **errp);
+RAMBlock *qemu_ram_alloc_from_fd_from_base(ram_addr_t size, MemoryRegion *mr,
+                                 uint32_t ram_flags, int fd, off_t offset,
+                                 bool readonly, void *base, Error **errp);
 
 RAMBlock *qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
                                   MemoryRegion *mr, Error **errp);
 RAMBlock *qemu_ram_alloc(ram_addr_t size, uint32_t ram_flags, MemoryRegion *mr,
                          Error **errp);
+RAMBlock *qemu_ram_alloc_from_base(ram_addr_t size, uint32_t ram_flags,
+        MemoryRegion *mr, void *base, Error **errp);
 RAMBlock *qemu_ram_alloc_resizeable(ram_addr_t size, ram_addr_t max_size,
                                     void (*resized)(const char*,
                                                     uint64_t length,

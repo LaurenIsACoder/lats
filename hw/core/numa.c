@@ -707,9 +707,15 @@ void numa_complete_configuration(MachineState *ms)
                              " properties are mutually exclusive");
                 exit(1);
             }
+#ifdef CONFIG_LATX_HACK_MEM
+            uint64_t container_size = ms->numa_state->num_nodes == 1 ?
+                ms->numa_state->nodes[0].node_memdev->alloc_size : ms->ram_size;
+#else
+            uint64_t container_size = ms->ram_size;
+#endif
             ms->ram = g_new(MemoryRegion, 1);
             memory_region_init(ms->ram, OBJECT(ms), mc->default_ram_id,
-                               ms->ram_size);
+                               container_size);
             numa_init_memdev_container(ms, ms->ram);
         }
         /* QEMU needs at least all unique node pair distances to build
@@ -736,7 +742,31 @@ void numa_complete_configuration(MachineState *ms)
 
 void parse_numa_opts(MachineState *ms)
 {
+    uint64_t guest_start = 0;
+    int i;
+
     qemu_opts_foreach(qemu_find_opts("numa"), parse_numa, ms, &error_fatal);
+
+    if (!ms->numa_state) {
+        return;
+    }
+
+#ifdef CONFIG_LATX_HACK_MEM
+    if (ms->numa_state->num_nodes > 1 && !numa_uses_legacy_mem()) {
+        error_report("LATX hack memory does not support multiple NUMA memdev nodes");
+        exit(EXIT_FAILURE);
+    }
+#endif
+    for (i = 0; i < ms->numa_state->num_nodes; i++) {
+        HostMemoryBackend *backend = ms->numa_state->nodes[i].node_memdev;
+
+        if (!backend) {
+            continue;
+        }
+        host_memory_backend_prepare(backend, LATX_BACKEND_GUEST_RAM,
+                                    guest_start, &error_fatal);
+        guest_start += ms->numa_state->nodes[i].node_mem;
+    }
 }
 
 void numa_cpu_pre_plug(const CPUArchId *slot, DeviceState *dev, Error **errp)

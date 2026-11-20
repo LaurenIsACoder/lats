@@ -28,6 +28,7 @@
 #include "monitor/monitor.h"
 #endif
 #include "qemu/log.h"
+#include "latx/include/latx-options.h"
 #ifdef CONFIG_TCG
 #include "tcg/insn-start-words.h"
 #endif
@@ -161,6 +162,7 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
     /* update FPU flags */
     env->hflags = (env->hflags & ~(HF_MP_MASK | HF_EM_MASK | HF_TS_MASK)) |
         ((new_cr0 << (HF_MP_SHIFT - 1)) & (HF_MP_MASK | HF_EM_MASK | HF_TS_MASK));
+    update_hamt_en(env);
 }
 
 /* XXX: in legacy PAE mode, generate a GPF if reserved bits are set in
@@ -179,13 +181,23 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 {
     uint32_t hflags;
 
+    assert((env->cr[4] & CR4_TSD_MASK) == (new_cr4 & CR4_TSD_MASK));
+
 #if defined(DEBUG_MMU)
     printf("CR4 update: %08x -> %08x\n", (uint32_t)env->cr[4], new_cr4);
 #endif
-    if ((new_cr4 ^ env->cr[4]) &
-        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK |
-         CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_LA57_MASK)) {
+    uint32_t flush_bits = CR4_PCIDE_MASK | CR4_PGE_MASK | CR4_PAE_MASK |
+                          CR4_PSE_MASK | CR4_SMEP_MASK | CR4_SMAP_MASK |
+                          CR4_LA57_MASK;
+    if (option_pcid) {
+        flush_bits |= CR4_PKE_MASK | CR4_PKS_MASK;
+    }
+    if ((new_cr4 ^ env->cr[4]) & flush_bits) {
         tlb_flush(env_cpu(env));
+    }
+
+    if ((env->cr[4] & ~new_cr4) & CR4_PCIDE_MASK) {
+        env->hamt_guest_asid = 0xf;
     }
 
     /* Clear bits we're going to recompute.  */
@@ -224,6 +236,7 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 
     cpu_sync_bndcs_hflags(env);
     cpu_sync_avx_hflag(env);
+    update_hamt_en(env);
 }
 
 #if !defined(CONFIG_USER_ONLY)
@@ -613,6 +626,11 @@ void do_cpu_sipi(X86CPU *cpu)
 
 void cpu_load_efer(CPUX86State *env, uint64_t val)
 {
+#ifndef CONFIG_USER_ONLY
+    if (option_pcid && ((env->efer ^ val) & (MSR_EFER_NXE | MSR_EFER_LMA))) {
+        tlb_flush(env_cpu(env));
+    }
+#endif
     env->efer = val;
     env->hflags &= ~(HF_LMA_MASK | HF_SVME_MASK);
     if (env->efer & MSR_EFER_LMA) {
@@ -621,6 +639,7 @@ void cpu_load_efer(CPUX86State *env, uint64_t val)
     if (env->efer & MSR_EFER_SVME) {
         env->hflags |= HF_SVME_MASK;
     }
+    update_hamt_en(env);
 }
 
 uint8_t x86_ldub_phys(CPUState *cs, hwaddr addr)

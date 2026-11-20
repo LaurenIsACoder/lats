@@ -113,10 +113,13 @@ void tcg_gen_mb(TCGBar mb_type)
      */
     bool parallel = true;
 #endif
+    (void)parallel;
 
+#ifndef CONFIG_LATX_OPT
     if (parallel) {
         tcg_gen_op1(INDEX_op_mb, mb_type);
     }
+#endif
 }
 
 /* 32 bit ops */

@@ -75,6 +75,7 @@ struct hpet_fw_config
 } QEMU_PACKED;
 
 extern struct hpet_fw_config hpet_cfg;
+extern int hpet_offset_hpet_counter_last;
 
 #define TYPE_HPET "hpet"
 

@@ -27,6 +27,7 @@
 #include "qapi/qapi-types-common.h"
 #include "qemu/cpu-float.h"
 #include "qemu/timer.h"
+#include "latx/include/latx-ras-config.h"
 
 #define XEN_NR_VIRQS 24
 
@@ -173,6 +174,9 @@ typedef enum X86Seg {
 #define HF_MPX_IU_SHIFT     26 /* BND registers in-use */
 #define HF_UMIP_SHIFT       27 /* CR4.UMIP */
 #define HF_AVX_EN_SHIFT     28 /* AVX Enabled (CR4+XCR0) */
+#define HF_SIGFPE_ON        29 /* BND registers in-use */
+#define HF_HAMT_EN_SHIFT    30 /* HAMT enable */
+#define HF_FORCE_TB_MODE_SHIFT 31 /* force single-TB translation mode */
 
 #define HF_CPL_MASK          (3 << HF_CPL_SHIFT)
 #define HF_INHIBIT_IRQ_MASK  (1 << HF_INHIBIT_IRQ_SHIFT)
@@ -200,6 +204,9 @@ typedef enum X86Seg {
 #define HF_MPX_IU_MASK       (1 << HF_MPX_IU_SHIFT)
 #define HF_UMIP_MASK         (1 << HF_UMIP_SHIFT)
 #define HF_AVX_EN_MASK       (1 << HF_AVX_EN_SHIFT)
+#define HF_SIGFPE_ON_MASK    (1 << HF_SIGFPE_ON)
+#define HF_HAMT_EN_MASK      (1 << HF_HAMT_EN_SHIFT)
+#define HF_FORCE_TB_MODE     (UINT32_C(1) << HF_FORCE_TB_MODE_SHIFT)
 
 /* hflags2 */
 
@@ -1319,6 +1326,17 @@ typedef union ZMMReg {
     YMMReg   _y_ZMMReg[512 / 256];
 } ZMMReg;
 
+typedef union ZMMReg_128 {
+    uint8_t  _b_ZMMReg[128 / 8];
+    uint16_t _w_ZMMReg[128 / 16];
+    uint32_t _l_ZMMReg[128 / 32];
+    uint64_t _q_ZMMReg[128 / 64];
+    float16  _h_ZMMReg[128 / 16];
+    float32  _s_ZMMReg[128 / 32];
+    float64  _d_ZMMReg[128 / 64];
+    XMMReg   _x_ZMMReg[128 / 128];
+} ZMMReg_128;
+
 typedef struct BNDReg {
     uint64_t lb;
     uint64_t ub;
@@ -1586,11 +1604,84 @@ typedef struct HVFX86LazyFlags {
     target_ulong auxbits;
 } HVFX86LazyFlags;
 
+/* ASID 0 is the translator, 15 the untagged guest, and 16-31 PCID slots. */
+#define X86_PCID_SLOTS 16
+#define X86_HAMT_ASID_BASE 16
+
 typedef struct CPUArchState {
+    void *ptw4k;
+    void *ptw1m;
+    uint64_t vram_base;
+    uint64_t vram_size;
+    ZMMReg_128 xmm_regs[CPU_NB_REGS == 8 ? 8 : 32] QEMU_ALIGNED(16);
+    uint64_t vregs[5];
+    uint64_t save_regs[32];
+    uint64_t tmparea[4];
+    int fcsr;
+    int fcsr_simd;
+    int is_fcsr_simd;
+    uint32_t latxs_fpu;
+    void *tb_jmp_cache_ptr;
+    void *latx_njc_cache_ptr;
+    void *tu_generation_array;
+    uint16_t tu_generation;
+    uint16_t hamt_guest_asid;
+#ifdef CONFIG_SOFTMMU
+    /* Candidates for a split large mapping in the local HAMT TLB. */
+    uint32_t hamt_large_page_bits;
+#endif
+    void *pcid_itlb_user;
+    void *pcid_itlb_kernel;
+#ifdef CONFIG_SOFTMMU
+    /* Refill entry runs with only two scratch registers. Keep offsets small. */
+    uint64_t pcid_refills, pcid_refill_start, pcid_refill_ticks;
+#endif
+    void *s_ras_ptr;
+#ifdef CONFIG_RAS_PROFILER
+    void *ras_profile_ptr;
+#endif
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t rdtime;
+    uint64_t rdtime_tlbr;
+    void *hamt_data_ptr;
+#endif
+    ZMMReg_128 temp_xmm;
+    uint64_t temp128[2];
+#ifdef TARGET_X86_64
+    target_ulong lstar;
+    target_ulong cstar;
+    target_ulong fmask;
+    target_ulong kernelgsbase;
+#endif
+    /* fast access for apic */
+    uint8_t tpr;
+    int irrv;
+    int isrv;
+
+#ifdef CONFIG_LATX_OPT_NOFP
+    int nofp;
+#else
+	bool mode_fpu;
+#endif
+
+    void *syscall_tb;
+    uint64_t *rr_counter_ptr;
+    uint64_t *qemu_global_mutex_ptr;
+    void *apic_state;
+    void *hpet_state;
+    void *timers_state;
+    uint32_t *interrupt_request_ptr;
+#ifdef CONFIG_LATX_TB_EXEC_TRACE
+    void **tb_exec_trace;
+    uint64_t tb_exec_trace_nr;
+#endif
+
     /* standard registers */
     target_ulong regs[CPU_NB_REGS];
     target_ulong eip;
-    target_ulong eflags; /* eflags register. During CPU emulation, CC
+    target_ulong neip;
+    target_ulong host_sp;
+    uint32_t eflags; /* eflags register. During CPU emulation, CC
                         flags and DF are set to zero because they are
                         stored elsewhere */
 
@@ -1603,6 +1694,7 @@ typedef struct CPUArchState {
     uint32_t hflags; /* TB flags, see HF_xxx constants. These flags
                         are known at translation time. */
     uint32_t hflags2; /* various other flags, see HF2_xxx constants. */
+    uint32_t cflags;
 
     /* segments */
     SegmentCache segs[6]; /* selector values */
@@ -1610,6 +1702,12 @@ typedef struct CPUArchState {
     SegmentCache tr;
     SegmentCache gdt; /* only base and limit are used */
     SegmentCache idt; /* only base and limit are used */
+
+    /* for iret fast access */
+    uint32_t new_cs;
+    uint32_t cs_e1;
+    uint32_t cs_e2;
+    uint32_t old_cpl;
 
     target_ulong cr[5]; /* NOTE: cr1 is unused */
 
@@ -1645,9 +1743,16 @@ typedef struct CPUArchState {
     float_status mmx_status; /* for 3DNow! float ops */
     float_status sse_status;
     uint32_t mxcsr;
-    ZMMReg xmm_regs[CPU_NB_REGS == 8 ? 8 : 32] QEMU_ALIGNED(16);
+    uint32_t new_mxcsr;
+    uint32_t old_mxcsr;
+    uint32_t excp_divz;
+    //ZMMReg xmm_regs[CPU_NB_REGS == 8 ? 8 : 32] QEMU_ALIGNED(16);
     ZMMReg xmm_t0 QEMU_ALIGNED(16);
     MMXReg mmx_t0;
+
+    uint64_t tsc_adjust;
+    uint64_t tsc_deadline;
+    uint64_t tsc_aux;
 
     uint64_t opmask_regs[NB_OPMASK_REGS];
 #ifdef TARGET_X86_64
@@ -1662,17 +1767,6 @@ typedef struct CPUArchState {
     uint64_t star;
 
     uint64_t vm_hsave;
-
-#ifdef TARGET_X86_64
-    target_ulong lstar;
-    target_ulong cstar;
-    target_ulong fmask;
-    target_ulong kernelgsbase;
-#endif
-
-    uint64_t tsc_adjust;
-    uint64_t tsc_deadline;
-    uint64_t tsc_aux;
 
     uint64_t xcr0;
 
@@ -1783,6 +1877,18 @@ typedef struct CPUArchState {
 
     uintptr_t retaddr;
 
+#ifdef CONFIG_SOFTMMU
+    /* Unmigrated translation state; each vCPU owns its hardware ASID bank. */
+    uint16_t pcid_valid;
+    uint64_t pcid_context[X86_PCID_SLOTS];
+    struct {
+        uint64_t cr3_writes, pcide_writes, noflush, retained, bindings;
+        uint64_t cr3_ns, enables;
+        uint64_t cache_retained, cache_cold;
+        uint64_t invpcid[4], seen[64];
+    } pcid_stats;
+#endif
+
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
@@ -1879,7 +1985,36 @@ typedef struct CPUArchState {
     TPRAccess tpr_access_type;
 
     unsigned nr_dies;
+
+    ucontext_t *puc;
+    void *hamt_dune_kvm_cpu;
+    void *hamt_kvm_regs;
+    int hamt_injected_ade;
+    uint64_t hamt_injected_ade_pc;
+    uint64_t hamt_injected_ade_rj;
+    uint64_t hamt_injected_ade_rk;
+    bool in_hamt_exception;
 } CPUX86State;
+
+static inline int cpu_is_inhibit_irq(CPUState *cpu)
+{
+    CPUX86State *env = cpu->env_ptr;
+    if (env->hflags & HF_INHIBIT_IRQ_MASK) return 1;
+    return 0;
+}
+
+static inline int target_get_curr_mtcc_id(CPUX86State *env)
+{
+    if (qemu_tcg_mtcc_enabled()) {
+        /*
+         * CPL == 0 , MTCC_ID = 0
+         * CPL != 0 , MTCC_ID = 1
+         */
+        return (env->hflags & HF_CPL_MASK) ? 1 : 0;
+    } else {
+        return 0;
+    }
+}
 
 struct kvm_msrs;
 
@@ -2297,6 +2432,11 @@ static inline void cpu_get_tb_cpu_state(CPUX86State *env, vaddr *pc,
     }
 }
 
+static inline uint32_t cpu_get_tb_cpu_state_flags_no_eflags(CPUX86State *env)
+{
+    return env->hflags & ~(IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK);
+}
+
 void do_cpu_init(X86CPU *cpu);
 
 #define MCE_INJECT_BROADCAST    1
@@ -2306,7 +2446,29 @@ void cpu_x86_inject_mce(Monitor *mon, X86CPU *cpu, int bank,
                         uint64_t status, uint64_t mcg_status, uint64_t addr,
                         uint64_t misc, int flags);
 
+#ifdef CONFIG_LATX_OPT_EFLAGS
+
+#include "latx/include/latx-asm.h"
+
+static inline uint32_t __lbt_mfflag_all(void)
+{
+    int32_t val;
+    __asm__ __volatile__ (X86MFFLAG(%0):"=r"(val)::);
+    return val;
+}
+
+static inline void __lbt_mtflag_all(uint32_t eflags)
+{
+    __asm__ __volatile__ (X86MTFLAG(%0)::"r"(eflags):);
+}
+
+static inline uint32_t cpu_cc_compute_all(CPUX86State *env1, int op)
+{
+	return __lbt_mfflag_all();
+}
+#else
 uint32_t cpu_cc_compute_all(CPUX86State *env1, int op);
+#endif
 
 static inline uint32_t cpu_compute_eflags(CPUX86State *env)
 {
@@ -2365,6 +2527,7 @@ static inline bool cpu_vmx_maybe_enabled(CPUX86State *env)
 
 /* excp_helper.c */
 int get_pg_mode(CPUX86State *env);
+int update_hamt_en(CPUX86State *env);
 
 /* fpu_helper.c */
 void update_fp_status(CPUX86State *env);
@@ -2374,6 +2537,7 @@ void update_mxcsr_from_sse_status(CPUX86State *env);
 static inline void cpu_set_mxcsr(CPUX86State *env, uint32_t mxcsr)
 {
     env->mxcsr = mxcsr;
+    env->old_mxcsr = UINT32_MAX;
     if (tcg_enabled()) {
         update_mxcsr_status(env);
     }
@@ -2388,7 +2552,7 @@ static inline void cpu_set_fpuc(CPUX86State *env, uint16_t fpuc)
 }
 
 /* svm_helper.c */
-#ifdef CONFIG_USER_ONLY
+#if defined(CONFIG_USER_ONLY) || defined(CONFIG_LATX_OPT)
 static inline void
 cpu_svm_check_intercept_param(CPUX86State *env1, uint32_t type,
                               uint64_t param, uintptr_t retaddr)
@@ -2457,6 +2621,9 @@ static inline bool hyperv_feat_enabled(X86CPU *cpu, int feat)
 static inline uint64_t cr4_reserved_bits(CPUX86State *env)
 {
     uint64_t reserved_bits = CR4_RESERVED_MASK;
+    if (!(env->features[FEAT_1_ECX] & CPUID_EXT_PCID)) {
+        reserved_bits |= CR4_PCIDE_MASK;
+    }
     if (!env->features[FEAT_XSAVE]) {
         reserved_bits |= CR4_OSXSAVE_MASK;
     }

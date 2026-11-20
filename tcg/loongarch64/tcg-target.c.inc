@@ -1038,7 +1038,7 @@ static void tcg_out_exit_tb(TCGContext *s, uintptr_t a0)
 {
     /* Reuse the zeroing that exists for goto_ptr.  */
     if (a0 == 0) {
-        tcg_out_call_int(s, tcg_code_gen_epilogue, true);
+        tcg_out_call_int(s, tcg_code_gen_epilogue[s->mtcc_id], true);
     } else {
         tcg_out_movi(s, TCG_TYPE_PTR, TCG_REG_A0, a0);
         tcg_out_call_int(s, tb_ret_addr, true);
@@ -1658,6 +1658,14 @@ static const int tcg_target_callee_save_regs[] = {
 /* We're expecting to be able to use an immediate for frame allocation.  */
 QEMU_BUILD_BUG_ON(FRAME_SIZE > 0x7ff);
 
+#include "target/i386/latx/include/latx-sys-static-codes-func.h"
+
+static void tcg_target_2_lat_prologue(TCGContext *s)
+{
+    int inst_nr = target_latxs_static_codes(s->code_ptr, s->mtcc_id);
+    s->code_ptr += inst_nr;
+}
+
 /* Generate global QEMU prologue and epilogue code */
 static void tcg_target_qemu_prologue(TCGContext *s)
 {
@@ -1684,7 +1692,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     tcg_out_opc_jirl(s, TCG_REG_ZERO, tcg_target_call_iarg_regs[1], 0);
 
     /* Return path for goto_ptr. Set return value to 0 */
-    tcg_code_gen_epilogue = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_code_gen_epilogue[s->mtcc_id] = tcg_splitwx_to_rx(s->code_ptr);
     tcg_out_mov(s, TCG_TYPE_REG, TCG_REG_A0, TCG_REG_ZERO);
 
     /* TB epilogue */
@@ -1775,4 +1783,63 @@ static const DebugFrame debug_frame = {
 void tcg_register_jit(const void *buf, size_t buf_size)
 {
     tcg_register_jit_int(buf, buf_size, &debug_frame, sizeof(debug_frame));
+}
+
+/* offset has been shifted to the right by two digits. */
+void latxs_aot_ir2_jmp_far(uint32_t *pinsn, int offset, int link)
+{
+    /* fprintf(stderr, "latxs_aot_ir2_jmp_far pinsn %x %x TCG_REG_T0 %d link %d\n", */
+    /*     *pinsn, *(pinsn + 1), TCG_REG_T0, link & 0xffff); */
+    
+    int reg_num = link >> 16;
+    link = link & 0xffff;
+    TCGReg link_reg = link ? TCG_REG_RA : TCG_REG_ZERO;
+    uint32_t insn;
+    if (option_large_code_cache) {
+        if (offset - 1 == sextreg(offset - 1, 0, 26)) {
+            if (link) {
+                insn = encode_sd10k16_insn(OPC_BL, offset - 1);
+            } else {
+                insn = encode_sd10k16_insn(OPC_B, offset - 1);
+            }
+            *pinsn = 0x03400000;
+            *(pinsn + 1) = insn;
+        } else {
+            int32_t i1, i2;
+            int64_t upper, lower;
+            upper = ((offset + (1 << 15)) >> 16) & 0xfffff;
+            lower = (offset & 0xffff);
+            i1 = encode_dsj20_insn(OPC_PCADDU18I, reg_num, upper);
+            i2 = encode_djsk16_insn(OPC_JIRL, link_reg, reg_num, lower);
+            *(pinsn + 1) = (int32_t)i2;
+            *pinsn = i1;
+        }
+    } else {
+        if (link) {
+            insn = encode_sd10k16_insn(OPC_BL, offset);
+        } else {
+            insn = encode_sd10k16_insn(OPC_B, offset);
+        }
+        *pinsn = 0x03400000;
+        *(pinsn + 1) = insn;
+    }
+    /* fprintf(stderr, "latxs_aot_ir2_jmp_far ------------  pinsn %x %x\n", */
+    /*     *pinsn, *(pinsn + 1)); */
+}
+
+void latxs_aot_ir2_jmp_near(uint32_t *pinsn, int offset, int link)
+{
+    link = link & 0xffff;
+    uint32_t insn;
+    if (option_large_code_cache && (offset != sextreg(offset, 0, 26))) {
+        fprintf(stderr, "latxs_aot_ir2_jmp_near cannot jump too far offset %lf MB\n",
+            (double)offset * 4 / 1024 / 1024);
+        exit(-1);
+    }
+    if (link) {
+        insn = encode_sd10k16_insn(OPC_BL, offset);
+    } else {
+        insn = encode_sd10k16_insn(OPC_B, offset);
+    }
+    *(pinsn) = insn;
 }

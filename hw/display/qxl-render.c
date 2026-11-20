@@ -131,9 +131,8 @@ static void qxl_render_update_area_unlocked(PCIQXLDevice *qxl)
                  qxl->guest_primary.abs_stride,
                  qxl->guest_primary.data);
         } else {
-            surface = qemu_create_displaysurface
-                (width,
-                 height);
+            surface = qemu_create_displaysurface_bpp
+                (width, height, qxl->guest_primary.bits_pp);
         }
         dpy_gfx_replace_surface(vga->con, surface);
     }

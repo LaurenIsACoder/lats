@@ -58,7 +58,7 @@
  * Fix the number of mmu modes to 16, which is also the maximum
  * supported by the softmmu tlb api.
  */
-#define NB_MMU_MODES 16
+#define NB_MMU_MODES 8
 
 #if defined(CONFIG_SOFTMMU) && defined(CONFIG_TCG)
 #include "exec/tlb-common.h"
@@ -161,10 +161,14 @@ typedef struct CPUTLBDesc {
     size_t window_max_entries;
     size_t n_used_entries;
     /* The next index to use in the tlb victim table.  */
+
+#ifdef CONFIG_VICTIM_TLB
     size_t vindex;
     /* The tlb victim table, in two parts.  */
     CPUTLBEntry vtable[CPU_VTLB_SIZE];
     CPUTLBEntryFull vfulltlb[CPU_VTLB_SIZE];
+#endif
+
     CPUTLBEntryFull *fulltlb;
 } CPUTLBDesc;
 
@@ -209,11 +213,19 @@ typedef struct CPUTLB { } CPUTLB;
 
 #endif /* CONFIG_SOFTMMU && CONFIG_TCG */
 
+#if defined(CONFIG_SOFTMMU)
+#include "tcg/fast-itlb.h"
+#endif
+
 /*
  * This structure must be placed in ArchCPU immediately
  * before CPUArchState, as a field named "neg".
  */
 typedef struct CPUNegativeOffsetState {
+#if defined(CONFIG_SOFTMMU)
+    fast_itlb_table_t itlb_knosmap;
+    fast_itlb_table_t itlb_user;
+#endif
     CPUTLB tlb;
     IcountDecr icount_decr;
 } CPUNegativeOffsetState;

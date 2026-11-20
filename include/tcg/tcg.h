@@ -235,7 +235,9 @@ typedef struct TCGPool {
 #define TCG_POOL_CHUNK_SIZE 32768
 
 #define TCG_MAX_TEMPS 512
-#define TCG_MAX_INSNS 512
+//#define TCG_MAX_INSNS 512
+//#define TCG_MAX_TEMPS 128
+#define TCG_MAX_INSNS 128
 
 /* when the size of the arguments of a called function is smaller than
    this value, they are statically allocated in the TB stack frame */
@@ -488,6 +490,8 @@ struct TCGContext {
     int nb_ops;
     TCGType addr_type;            /* TCG_TYPE_I32 or TCG_TYPE_I64 */
 
+    uint32_t mtcc_id;
+
 #ifdef CONFIG_SOFTMMU
     int tlb_fast_offset;
     int page_mask;
@@ -504,6 +508,8 @@ struct TCGContext {
     TCGTemp *frame_temp;
 
     TranslationBlock *gen_tb;     /* tb for which code is being generated */
+    unsigned long pre_locked_page0;
+    unsigned long pre_locked_page1;
     tcg_insn_unit *code_buf;      /* pointer for start of tb */
     tcg_insn_unit *code_ptr;      /* pointer for running end of tb */
 
@@ -575,7 +581,8 @@ static inline bool temp_readonly(TCGTemp *ts)
 }
 
 extern __thread TCGContext *tcg_ctx;
-extern const void *tcg_code_gen_epilogue;
+extern __thread TCGContext *tcg_ctx_mtcc[];
+extern const void *tcg_code_gen_epilogue[];
 extern uintptr_t tcg_splitwx_diff;
 extern TCGv_env cpu_env;
 
@@ -743,7 +750,7 @@ static inline bool tcg_op_buf_full(void)
      * 16-bit unsigned offsets, TranslationBlock.jmp_reset_offset[]
      * and TCGContext.gen_insn_end_off[].
      */
-    return tcg_ctx->nb_ops >= 4000;
+    return tcg_ctx->nb_ops >= 8000;
 }
 
 /* pool based memory allocation */
@@ -752,8 +759,11 @@ static inline bool tcg_op_buf_full(void)
 void *tcg_malloc_internal(TCGContext *s, int size);
 void tcg_pool_reset(TCGContext *s);
 TranslationBlock *tcg_tb_alloc(TCGContext *s);
+TranslationBlock *tcg_tb_alloc_full(TCGContext *s);
 
 void tcg_region_reset_all(void);
+void tcg_region_reset_mtcc(uint32_t mtcc_id);
+void *tcg_region_alloc_data(TCGContext *s, size_t size);
 
 size_t tcg_code_size(void);
 size_t tcg_code_capacity(void);
@@ -1103,7 +1113,9 @@ static inline size_t tcg_current_code_size(TCGContext *s)
 uintptr_t tcg_qemu_tb_exec(CPUArchState *env, const void *tb_ptr);
 #else
 typedef uintptr_t tcg_prologue_fn(CPUArchState *env, const void *tb_ptr);
-extern tcg_prologue_fn *tcg_qemu_tb_exec;
+typedef uintptr_t tcg_prologue_fn2(const void *tb_ptr, CPUArchState *env);
+extern tcg_prologue_fn *tcg_qemu_tb_exec[];
+extern tcg_prologue_fn2 *tcg_qemu_tb_exec2[];
 #endif
 
 void tcg_register_jit(const void *buf, size_t buf_size);
@@ -1147,5 +1159,7 @@ static inline const TCGOpcode *tcg_swap_vecop_list(const TCGOpcode *n)
 }
 
 bool tcg_can_emit_vecop_list(const TCGOpcode *, TCGType, unsigned);
-
+void latxs_aot_ir2_jmp_far(uint32_t *pinsn, int offset, int link);
+void latxs_aot_ir2_jmp_near(uint32_t *pinsn, int offset, int link);
+int reset_region_offset(int offset, uint32_t mtcc_id);
 #endif /* TCG_H */

@@ -7,7 +7,7 @@ QEMUGLContext qemu_egl_create_context(DisplayGLCtx *dgc,
 {
    EGLContext ctx;
    EGLint ctx_att_core[] = {
-       EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+       EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
        EGL_CONTEXT_CLIENT_VERSION, params->major_ver,
        EGL_CONTEXT_MINOR_VERSION_KHR, params->minor_ver,
        EGL_NONE

@@ -177,6 +177,34 @@ static void *mmap_reserve(size_t size, int fd)
     return mmap(0, size, PROT_NONE, flags, fd, 0);
 }
 
+static void *mmap_reserve_base(size_t size, int fd, void *base)
+{
+    int flags = MAP_PRIVATE;
+
+#if defined(__powerpc64__) && defined(__linux__)
+    /*
+     * On ppc64 mappings in the same segment (aka slice) must share the same
+     * page size. Since we will be re-allocating part of this segment
+     * from the supplied fd, we should make sure to use the same page size, to
+     * this end we mmap the supplied fd.  In this case, set MAP_NORESERVE to
+     * avoid allocating backing store memory.
+     * We do this unless we are using the system page size, in which case
+     * anonymous memory is OK.
+     */
+    if (fd == -1 || qemu_fd_getpagesize(fd) == qemu_real_host_page_size()) {
+        fd = -1;
+        flags |= MAP_ANONYMOUS;
+    } else {
+        flags |= MAP_NORESERVE;
+    }
+#else
+    fd = -1;
+    flags |= MAP_ANONYMOUS;
+#endif
+
+    return mmap(base, size, PROT_NONE, flags, fd, 0);
+}
+
 /*
  * Activate memory in a reserved region from the given fd (if any), to make
  * it accessible.
@@ -261,6 +289,57 @@ void *qemu_ram_mmap(int fd,
     total = size + align;
 
     guardptr = mmap_reserve(total, fd);
+    if (guardptr == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    assert(is_power_of_2(align));
+    /* Always align to host page size */
+    assert(align >= guard_pagesize);
+
+    offset = QEMU_ALIGN_UP((uintptr_t)guardptr, align) - (uintptr_t)guardptr;
+
+    ptr = mmap_activate(guardptr + offset, size, fd, qemu_map_flags,
+                        map_offset);
+    if (ptr == MAP_FAILED) {
+        munmap(guardptr, total);
+        return MAP_FAILED;
+    }
+
+    if (offset > 0) {
+        munmap(guardptr, offset);
+    }
+
+    /*
+     * Leave a single PROT_NONE page allocated after the RAM block, to serve as
+     * a guard page guarding against potential buffer overflows.
+     */
+    total -= offset;
+    if (total > size + guard_pagesize) {
+        munmap(ptr + size + guard_pagesize, total - size - guard_pagesize);
+    }
+
+    return ptr;
+}
+
+void *qemu_ram_mmap_base(int fd,
+                    size_t size,
+                    size_t align,
+                    uint32_t qemu_map_flags,
+                    off_t map_offset,
+                    void *base)
+{
+    const size_t guard_pagesize = mmap_guard_pagesize(fd);
+    size_t offset, total;
+    void *ptr, *guardptr;
+
+    /*
+     * Note: this always allocates at least one extra page of virtual address
+     * space, even if size is already aligned.
+     */
+    total = size + align;
+
+    guardptr = mmap_reserve_base(total, fd, base);
     if (guardptr == MAP_FAILED) {
         return MAP_FAILED;
     }

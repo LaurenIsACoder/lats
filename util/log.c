@@ -499,6 +499,8 @@ const QEMULogItem qemu_log_items[] = {
       "open a separate log file per thread; filename must contain '%d'" },
     { CPU_LOG_TB_VPU, "vpu",
       "include VPU registers in the 'cpu' logging" },
+    { LAT_LOG_PUSHPOP, "pushpop",
+      "push pop debung" },
     { 0, NULL, NULL },
 };
 

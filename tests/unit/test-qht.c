@@ -251,10 +251,84 @@ static void test_resize(void)
     qht_test(QHT_MODE_AUTO_RESIZE);
 }
 
+typedef struct TryIterForkData {
+    GMutex mutex;
+    GCond cond;
+    bool iterating;
+    bool release;
+} TryIterForkData;
+
+static void hold_iter_func(void *p, uint32_t hash, void *userp)
+{
+    TryIterForkData *data = userp;
+
+    g_mutex_lock(&data->mutex);
+    data->iterating = true;
+    g_cond_signal(&data->cond);
+    while (!data->release) {
+        g_cond_wait(&data->cond, &data->mutex);
+    }
+    g_mutex_unlock(&data->mutex);
+}
+
+static gpointer hold_qht_locks(gpointer opaque)
+{
+    TryIterForkData *data = opaque;
+
+    qht_iter(&ht, hold_iter_func, data);
+    return NULL;
+}
+
+static void test_iter_try_post_fork(void)
+{
+    TryIterForkData data = { 0 };
+    GThread *thread;
+    pid_t pid;
+    int status;
+
+    qht_init(&ht, is_equal, 0, 0);
+    insert(0, 1);
+
+    g_mutex_init(&data.mutex);
+    g_cond_init(&data.cond);
+    thread = g_thread_new("qht-lock-holder", hold_qht_locks, &data);
+
+    g_mutex_lock(&data.mutex);
+    while (!data.iterating) {
+        g_cond_wait(&data.cond, &data.mutex);
+    }
+    g_mutex_unlock(&data.mutex);
+
+    pid = fork();
+    g_assert_cmpint(pid, >=, 0);
+    if (pid == 0) {
+        unsigned int count = 0;
+        size_t skipped = qht_iter_try(&ht, count_func, &count);
+
+        _exit(skipped > 0 && count == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    g_assert_cmpint(waitpid(pid, &status, 0), ==, pid);
+
+    g_mutex_lock(&data.mutex);
+    data.release = true;
+    g_cond_signal(&data.cond);
+    g_mutex_unlock(&data.mutex);
+    g_thread_join(thread);
+
+    g_assert_true(WIFEXITED(status));
+    g_assert_cmpint(WEXITSTATUS(status), ==, EXIT_SUCCESS);
+
+    g_cond_clear(&data.cond);
+    g_mutex_clear(&data.mutex);
+    qht_destroy(&ht);
+}
+
 int main(int argc, char *argv[])
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/qht/mode/default", test_default);
     g_test_add_func("/qht/mode/resize", test_resize);
+    g_test_add_func("/qht/iter/try-post-fork", test_iter_try_post_fork);
     return g_test_run();
 }

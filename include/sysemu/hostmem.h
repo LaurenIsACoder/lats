@@ -39,6 +39,12 @@ OBJECT_DECLARE_TYPE(HostMemoryBackend, HostMemoryBackendClass,
  */
 #define TYPE_MEMORY_BACKEND_FILE "memory-backend-file"
 
+typedef enum LatxBackendRole {
+    LATX_BACKEND_NONE,
+    LATX_BACKEND_GUEST_RAM,
+    LATX_BACKEND_DEVICE_RAM,
+} LatxBackendRole;
+
 
 /**
  * HostMemoryBackendClass:
@@ -64,6 +70,9 @@ struct HostMemoryBackend {
 
     /* protected */
     uint64_t size;
+    uint64_t alloc_size;
+    uint64_t latx_guest_start;
+    LatxBackendRole latx_role;
     bool merge, dump, use_canonical_path;
     bool prealloc, is_mapped, share, reserve;
     uint32_t prealloc_threads;
@@ -73,6 +82,11 @@ struct HostMemoryBackend {
 
     MemoryRegion mr;
 };
+bool host_memory_backend_prepare(HostMemoryBackend *backend,
+                                 LatxBackendRole role,
+                                 uint64_t guest_start,
+                                 Error **errp);
+uint64_t host_memory_backend_alloc_size(HostMemoryBackend *backend);
 
 bool host_memory_backend_mr_inited(HostMemoryBackend *backend);
 MemoryRegion *host_memory_backend_get_memory(HostMemoryBackend *backend);

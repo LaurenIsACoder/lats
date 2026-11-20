@@ -31,6 +31,10 @@
 #include "ui/shader/texture-blit-flip-vert.h"
 #include "ui/shader/texture-blit-frag.h"
 
+#include "ui/shader/texture-blit-old-vert.h"
+#include "ui/shader/texture-blit-flip-old-vert.h"
+#include "ui/shader/texture-blit-old-frag.h"
+
 struct QemuGLShader {
     GLint texture_blit_prog;
     GLint texture_blit_flip_prog;
@@ -158,7 +162,14 @@ QemuGLShader *qemu_gl_init_shader(void)
     gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
         (texture_blit_flip_vert_src, texture_blit_frag_src);
     if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
-        exit(1);
+        fprintf(stderr, "warning: use glsl version 120 shaders, skip errors!\n");
+        gls->texture_blit_prog = qemu_gl_create_compile_link_program
+            (texture_blit_old_vert_src, texture_blit_old_frag_src);
+        gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
+            (texture_blit_flip_old_vert_src, texture_blit_old_frag_src);
+        if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
+            exit(1);
+        }
     }
 
     gls->texture_blit_vao =

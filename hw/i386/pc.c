@@ -26,6 +26,7 @@
 #include "qemu/units.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
+#include "latx-hack.h"
 #include "hw/char/serial.h"
 #include "hw/char/parallel.h"
 #include "hw/i386/topology.h"
@@ -967,6 +968,12 @@ void pc_memory_init(PCMachineState *pcms,
     assert(machine->ram_size == x86ms->below_4g_mem_size +
                                 x86ms->above_4g_mem_size);
 
+#ifdef CONFIG_LATX_HACK_MEM
+    latx_hack_mem_set_layout(x86ms->below_4g_mem_size,
+                             x86ms->above_4g_mem_start,
+                             x86ms->above_4g_mem_size);
+#endif
+
     linux_boot = (machine->kernel_filename != NULL);
 
     /*
@@ -1014,10 +1021,17 @@ void pc_memory_init(PCMachineState *pcms,
     e820_add_entry(0, x86ms->below_4g_mem_size, E820_RAM);
     if (x86ms->above_4g_mem_size > 0) {
         ram_above_4g = g_malloc(sizeof(*ram_above_4g));
+#ifdef CONFIG_LATX_HACK_MEM
+        memory_region_init_alias(ram_above_4g, NULL, "ram-above-4g",
+                                 machine->ram,
+                                 4 * GiB,
+                                 x86ms->above_4g_mem_size);
+#else
         memory_region_init_alias(ram_above_4g, NULL, "ram-above-4g",
                                  machine->ram,
                                  x86ms->below_4g_mem_size,
                                  x86ms->above_4g_mem_size);
+#endif
         memory_region_add_subregion(system_memory, x86ms->above_4g_mem_start,
                                     ram_above_4g);
         e820_add_entry(x86ms->above_4g_mem_start, x86ms->above_4g_mem_size,

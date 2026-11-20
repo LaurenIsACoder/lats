@@ -74,6 +74,10 @@ struct HPETState {
 
     MemoryRegion iomem;
     uint64_t hpet_offset;
+    uint64_t hpet_offset_ticks;
+    uint64_t config;            /* configuration */
+    uint64_t hpet_counter;      /* main counter */
+    uint64_t hpet_counter_last; /* greatest tick returned by lockless reads */
     bool hpet_offset_saved;
     qemu_irq irqs[HPET_NUM_IRQ_ROUTES];
     uint32_t flags;
@@ -85,15 +89,21 @@ struct HPETState {
 
     /* Memory-mapped, software visible registers */
     uint64_t capability;        /* capabilities */
-    uint64_t config;            /* configuration */
+//    uint64_t config;            /* configuration */
     uint64_t isr;               /* interrupt status reg */
-    uint64_t hpet_counter;      /* main counter */
+//    uint64_t hpet_counter;      /* main counter */
     uint8_t  hpet_id;           /* instance id */
 };
 
+void *hpet_global_ptr;
+int hpet_offset_hpet_offset_ticks;
+int hpet_offset_hpet_counter;
+int hpet_offset_hpet_counter_last;
+int hpet_offset_config;
+
 static uint32_t hpet_in_legacy_mode(HPETState *s)
 {
-    return s->config & HPET_CFG_LEGACY;
+    return qatomic_load_acquire(&s->config) & HPET_CFG_LEGACY;
 }
 
 static uint32_t timer_int_route(struct HPETTimer *timer)
@@ -108,7 +118,7 @@ static uint32_t timer_fsb_route(HPETTimer *t)
 
 static uint32_t hpet_enabled(HPETState *s)
 {
-    return s->config & HPET_CFG_ENABLE;
+    return qatomic_load_acquire(&s->config) & HPET_CFG_ENABLE;
 }
 
 static uint32_t timer_is_periodic(HPETTimer *t)
@@ -160,7 +170,24 @@ static int deactivating_bit(uint64_t old, uint64_t new, uint64_t mask)
 
 static uint64_t hpet_get_ticks(HPETState *s)
 {
-    return ns_to_ticks(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->hpet_offset);
+    return ns_to_ticks(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                       qatomic_read_u64(&s->hpet_offset));
+}
+
+static uint64_t hpet_get_ticks_monotonic(HPETState *s)
+{
+    uint64_t ticks = hpet_get_ticks(s);
+    uint64_t last = qatomic_read_u64(&s->hpet_counter_last);
+
+    while (ticks > last) {
+        uint64_t old = qatomic_cmpxchg(&s->hpet_counter_last, last, ticks);
+
+        if (old == last) {
+            return ticks;
+        }
+        last = old;
+    }
+    return last;
 }
 
 /*
@@ -227,7 +254,7 @@ static int hpet_pre_save(void *opaque)
 
     /* save current counter value */
     if (hpet_enabled(s)) {
-        s->hpet_counter = hpet_get_ticks(s);
+        qatomic_set_u64(&s->hpet_counter, hpet_get_ticks_monotonic(s));
     }
 
     return 0;
@@ -260,9 +287,15 @@ static int hpet_post_load(void *opaque, int version_id)
 
     /* Recalculate the offset between the main counter and guest time */
     if (!s->hpet_offset_saved) {
-        s->hpet_offset = ticks_to_ns(s->hpet_counter)
-                        - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint64_t offset =
+            ticks_to_ns(qatomic_read_u64(&s->hpet_counter)) -
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        qatomic_set_u64(&s->hpet_offset, offset);
+        s->hpet_offset_ticks = (int64_t)offset / 10;
     }
+    qatomic_set_u64(&s->hpet_counter_last,
+                    qatomic_read_u64(&s->hpet_counter));
 
     /* Push number of timers into capability returned via HPET_ID */
     s->capability &= ~HPET_ID_NUM_TIM_MASK;
@@ -372,7 +405,7 @@ static void hpet_timer(void *opaque)
     uint64_t diff;
 
     uint64_t period = t->period;
-    uint64_t cur_tick = hpet_get_ticks(t->state);
+    uint64_t cur_tick = hpet_get_ticks_monotonic(t->state);
 
     if (timer_is_periodic(t) && period != 0) {
         if (t->config & HPET_TN_32BIT) {
@@ -400,7 +433,7 @@ static void hpet_set_timer(HPETTimer *t)
 {
     uint64_t diff;
     uint32_t wrap_diff;  /* how many ticks until we wrap? */
-    uint64_t cur_tick = hpet_get_ticks(t->state);
+    uint64_t cur_tick = hpet_get_ticks_monotonic(t->state);
 
     /* whenever new timer is being set up, make sure wrap_flag is 0 */
     t->wrap_flag = 0;
@@ -467,23 +500,23 @@ static uint64_t hpet_ram_read(void *opaque, hwaddr addr,
         case HPET_PERIOD:
             return s->capability >> 32;
         case HPET_CFG:
-            return s->config;
+            return qatomic_load_acquire(&s->config);
         case HPET_CFG + 4:
             DPRINTF("qemu: invalid HPET_CFG + 4 hpet_ram_readl\n");
             return 0;
         case HPET_COUNTER:
             if (hpet_enabled(s)) {
-                cur_tick = hpet_get_ticks(s);
+                cur_tick = hpet_get_ticks_monotonic(s);
             } else {
-                cur_tick = s->hpet_counter;
+                cur_tick = qatomic_read_u64(&s->hpet_counter);
             }
             DPRINTF("qemu: reading counter  = %" PRIx64 "\n", cur_tick);
             return cur_tick;
         case HPET_COUNTER + 4:
             if (hpet_enabled(s)) {
-                cur_tick = hpet_get_ticks(s);
+                cur_tick = hpet_get_ticks_monotonic(s);
             } else {
-                cur_tick = s->hpet_counter;
+                cur_tick = qatomic_read_u64(&s->hpet_counter);
             }
             DPRINTF("qemu: reading counter + 4  = %" PRIx64 "\n", cur_tick);
             return cur_tick >> 32;
@@ -601,11 +634,18 @@ static void hpet_ram_write(void *opaque, hwaddr addr,
             return;
         case HPET_CFG:
             val = hpet_fixup_reg(new_val, old_val, HPET_CFG_WRITE_MASK);
-            s->config = (s->config & 0xffffffff00000000ULL) | val;
+            val |= qatomic_read_u64(&s->config) & 0xffffffff00000000ULL;
             if (activating_bit(old_val, new_val, HPET_CFG_ENABLE)) {
                 /* Enable main counter and interrupt generation. */
-                s->hpet_offset =
-                    ticks_to_ns(s->hpet_counter) - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                uint64_t offset =
+                    ticks_to_ns(qatomic_read_u64(&s->hpet_counter)) -
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+                qatomic_set_u64(&s->hpet_offset, offset);
+                qatomic_set_u64(&s->hpet_counter_last,
+                                qatomic_read_u64(&s->hpet_counter));
+                s->hpet_offset_ticks = (int64_t)offset / 10;
+                qatomic_store_release(&s->config, val);
                 for (i = 0; i < s->num_timers; i++) {
                     if ((&s->timer[i])->cmp != ~0ULL) {
                         hpet_set_timer(&s->timer[i]);
@@ -613,10 +653,16 @@ static void hpet_ram_write(void *opaque, hwaddr addr,
                 }
             } else if (deactivating_bit(old_val, new_val, HPET_CFG_ENABLE)) {
                 /* Halt main counter and disable interrupt generation. */
-                s->hpet_counter = hpet_get_ticks(s);
+                uint64_t counter = hpet_get_ticks_monotonic(s);
+
+                qatomic_set_u64(&s->hpet_counter, counter);
+                qatomic_set_u64(&s->hpet_counter_last, counter);
+                qatomic_store_release(&s->config, val);
                 for (i = 0; i < s->num_timers; i++) {
                     hpet_del_timer(&s->timer[i]);
                 }
+            } else {
+                qatomic_store_release(&s->config, val);
             }
             /* i8254 and RTC output pins are disabled
              * when HPET is in legacy mode */
@@ -645,19 +691,27 @@ static void hpet_ram_write(void *opaque, hwaddr addr,
             if (hpet_enabled(s)) {
                 DPRINTF("qemu: Writing counter while HPET enabled!\n");
             }
-            s->hpet_counter =
-                (s->hpet_counter & 0xffffffff00000000ULL) | value;
+            qatomic_set_u64(&s->hpet_counter,
+                (qatomic_read_u64(&s->hpet_counter) &
+                 0xffffffff00000000ULL) | value);
+            qatomic_set_u64(&s->hpet_counter_last,
+                            qatomic_read_u64(&s->hpet_counter));
             DPRINTF("qemu: HPET counter written. ctr = 0x%" PRIx64 " -> "
-                    "%" PRIx64 "\n", value, s->hpet_counter);
+                    "%" PRIx64 "\n", value,
+                    qatomic_read_u64(&s->hpet_counter));
             break;
         case HPET_COUNTER + 4:
             if (hpet_enabled(s)) {
                 DPRINTF("qemu: Writing counter while HPET enabled!\n");
             }
-            s->hpet_counter =
-                (s->hpet_counter & 0xffffffffULL) | (((uint64_t)value) << 32);
+            qatomic_set_u64(&s->hpet_counter,
+                (qatomic_read_u64(&s->hpet_counter) & 0xffffffffULL) |
+                (((uint64_t)value) << 32));
+            qatomic_set_u64(&s->hpet_counter_last,
+                            qatomic_read_u64(&s->hpet_counter));
             DPRINTF("qemu: HPET counter + 4 written. ctr = 0x%" PRIx64 " -> "
-                    "%" PRIx64 "\n", value, s->hpet_counter);
+                    "%" PRIx64 "\n", value,
+                    qatomic_read_u64(&s->hpet_counter));
             break;
         default:
             DPRINTF("qemu: invalid hpet_ram_writel\n");
@@ -666,9 +720,21 @@ static void hpet_ram_write(void *opaque, hwaddr addr,
     }
 }
 
+static bool hpet_ram_access_lockless(void *opaque, hwaddr addr,
+                                     unsigned size, bool is_write,
+                                     MemTxAttrs attrs)
+{
+    (void)opaque;
+    (void)attrs;
+
+    return !is_write && size == 4 &&
+           (addr == HPET_COUNTER || addr == HPET_COUNTER + 4);
+}
+
 static const MemoryRegionOps hpet_ram_ops = {
     .read = hpet_ram_read,
     .write = hpet_ram_write,
+    .access_lockless = hpet_ram_access_lockless,
     .valid = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -698,9 +764,11 @@ static void hpet_reset(DeviceState *d)
     }
 
     qemu_set_irq(s->pit_enabled, 1);
-    s->hpet_counter = 0ULL;
-    s->hpet_offset = 0ULL;
-    s->config = 0ULL;
+    qatomic_set_u64(&s->hpet_counter, 0);
+    qatomic_set_u64(&s->hpet_counter_last, 0);
+    qatomic_set_u64(&s->hpet_offset, 0);
+    s->hpet_offset_ticks = 0ULL;
+    qatomic_store_release(&s->config, 0);
     hpet_cfg.hpet[s->hpet_id].event_timer_block_id = (uint32_t)s->capability;
     hpet_cfg.hpet[s->hpet_id].address = sbd->mmio[0].addr;
 
@@ -729,8 +797,18 @@ static void hpet_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     HPETState *s = HPET(obj);
 
+    hpet_global_ptr = s;
+    hpet_offset_hpet_offset_ticks = offsetof(HPETState, hpet_offset_ticks);
+    hpet_offset_hpet_counter = offsetof(HPETState, hpet_counter);
+    hpet_offset_hpet_counter_last = offsetof(HPETState, hpet_counter_last);
+    hpet_offset_config = offsetof(HPETState, config);
+
     /* HPET Area */
     memory_region_init_io(&s->iomem, obj, &hpet_ram_ops, s, "hpet", HPET_LEN);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Counter reads may run concurrently on multiple vCPU threads. */
+    s->iomem.disable_reentrancy_guard = true;
+#endif
     sysbus_init_mmio(sbd, &s->iomem);
 }
 

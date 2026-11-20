@@ -3680,7 +3680,13 @@ int ram_load_postcopy(QEMUFile *f, int channel)
              * while in postcopy, which is fine - trying to place via
              * UFFDIO_COPY/UFFDIO_ZEROPAGE will never segfault.
              */
-            if (!block->host || addr >= block->postcopy_length) {
+            if (block->alloc_from_base && block->host != block->base) {
+                error_report("Illegal RAM host " RAM_ADDR_FMT " base " RAM_ADDR_FMT,
+                        (uint64_t)block->host, (uint64_t)block->base);
+                ret = -EINVAL;
+                break;
+            }
+            if ((!block->host && !block->alloc_from_base) || addr >= block->postcopy_length) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
                 break;
@@ -3947,7 +3953,13 @@ static int ram_load_precopy(QEMUFile *f)
                     host_bak = colo_cache_from_block_offset(block, addr, false);
                 }
             }
-            if (!host) {
+            if (block->alloc_from_base && block->host != block->base) {
+                error_report("Illegal RAM host " RAM_ADDR_FMT " base " RAM_ADDR_FMT,
+                        (uint64_t)block->host, (uint64_t)block->base);
+                ret = -EINVAL;
+                break;
+            }
+            if (!host && !block->alloc_from_base) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
                 break;

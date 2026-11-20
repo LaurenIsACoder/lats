@@ -586,6 +586,7 @@ void helper_clgi(CPUX86State *env)
     }
 }
 
+#ifndef CONFIG_LATX_OPT
 bool cpu_svm_has_intercept(CPUX86State *env, uint32_t type)
 {
     switch (type) {
@@ -672,6 +673,7 @@ void cpu_svm_check_intercept_param(CPUX86State *env, uint32_t type,
 
     cpu_vmexit(env, type, param, retaddr);
 }
+#endif
 
 void helper_svm_check_intercept(CPUX86State *env, uint32_t type)
 {

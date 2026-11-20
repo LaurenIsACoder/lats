@@ -1,7 +1,15 @@
-project('qemu', ['c'], meson_version: '>=0.63.0',
+project('lats', ['c'], meson_version: '>=0.63.0',
         default_options: ['warning_level=1', 'c_std=gnu11', 'cpp_std=gnu++11', 'b_colorout=auto',
-                          'b_staticpic=false', 'stdsplit=false', 'optimization=2', 'b_pie=true'],
+                          'b_staticpic=true', 'stdsplit=false', 'optimization=2', 'b_pie=true'],
         version: files('VERSION'))
+
+latx_version_cmd = [find_program('scripts/latx-version.sh')]
+latx_version_h = custom_target('latx-version.h',
+                                output :'latx-version.h',
+                                command : latx_version_cmd,
+                                capture: true,
+                                build_by_default: true,
+                                build_always_stale: true)
 
 add_test_setup('quick', exclude_suites: ['slow', 'thorough'], is_default: true)
 add_test_setup('slow', exclude_suites: ['thorough'], env: ['G_TEST_SLOW=1', 'SPEED=slow'])
@@ -53,6 +61,8 @@ config_host_data = configuration_data()
 genh = []
 qapi_trace_events = []
 
+genh += latx_version_h
+
 bsd_oses = ['gnu/kfreebsd', 'freebsd', 'netbsd', 'openbsd', 'dragonfly', 'darwin']
 supported_oses = ['windows', 'freebsd', 'netbsd', 'openbsd', 'darwin', 'sunos', 'linux']
 supported_cpus = ['ppc', 'ppc64', 's390x', 'riscv32', 'riscv64', 'x86', 'x86_64',
@@ -94,6 +104,8 @@ elif cpu == 'x86'
   host_arch = 'i386'
 elif cpu == 'mips64'
   host_arch = 'mips'
+elif cpu == 'loongarch64'
+  host_arch = 'loongarch64'
 elif cpu in ['riscv32', 'riscv64']
   host_arch = 'riscv'
 else
@@ -1063,10 +1075,12 @@ if not get_option('virglrenderer').auto() or have_system or have_vhost_user_gpu
                      method: 'pkg-config',
                      required: get_option('virglrenderer'))
   if virgl.found()
-    config_host_data.set('HAVE_VIRGL_D3D_INFO_EXT',
-                         cc.has_member('struct virgl_renderer_resource_info_ext', 'd3d_tex2d',
-                                       prefix: '#include <virglrenderer.h>',
-                                       dependencies: virgl))
+    config_host_data.set('VIRGL_VERSION_MAJOR', virgl.version().split('.')[0])
+    config_host_data.set('HAVE_VIRGL_RESOURCE_MAP_FIXED',
+                         cc.has_header_symbol(
+                           'virglrenderer.h',
+                           'virgl_renderer_resource_map_fixed',
+                           dependencies: virgl))
   endif
 endif
 blkio = not_found
@@ -2230,6 +2244,9 @@ config_host_data.set('CONFIG_FALLOCATE', cc.has_function('fallocate'))
 config_host_data.set('CONFIG_POSIX_FALLOCATE', cc.has_function('posix_fallocate'))
 config_host_data.set('CONFIG_GETCPU', cc.has_function('getcpu', prefix: gnu_source_prefix))
 config_host_data.set('CONFIG_SCHED_GETCPU', cc.has_function('sched_getcpu', prefix: '#include <sched.h>'))
+config_host_data.set('CONFIG_HAVE_STRUCT_SCHED_ATTR',
+                     cc.has_type('struct sched_attr',
+                                 prefix: gnu_source_prefix + '#include <sched.h>'))
 # Note that we need to specify prefix: here to avoid incorrectly
 # thinking that Windows has posix_memalign()
 config_host_data.set('CONFIG_POSIX_MEMALIGN', cc.has_function('posix_memalign', prefix: '#include <stdlib.h>'))
@@ -3452,8 +3469,8 @@ subdir('bsd-user')
 subdir('linux-user')
 
 # needed for fuzzing binaries
-subdir('tests/qtest/libqos')
-subdir('tests/qtest/fuzz')
+#subdir('tests/qtest/libqos')
+#subdir('tests/qtest/fuzz')
 
 # accel modules
 tcg_real_module_ss = ss.source_set()
@@ -3720,6 +3737,11 @@ foreach target : target_dirs
 
     arch_srcs += config_devices_h[target]
     link_args += ['@block.syms', '@qemu.syms']
+
+    if target_base_arch == 'i386' and host_arch == 'loongarch64'
+        target_inc += include_directories('target/i386/latx/include')
+        target_inc += include_directories('target/i386/hamt')
+    endif
   else
     abi = config_target['TARGET_ABI_DIR']
     target_type='user'
@@ -3751,6 +3773,10 @@ foreach target : target_dirs
           syscall_nr_generators[abi].process(base_dir / abi / config_target['TARGET_SYSTBL'],
                                              extra_args : config_target['TARGET_SYSTBL_ABI'])
       endif
+    endif
+    if target_base_arch == 'i386' and host_arch == 'loongarch64'
+        target_inc += include_directories('target/i386/latx/include')
+        target_inc += include_directories('target/i386/hamt')
     endif
   endif
 
@@ -3786,14 +3812,14 @@ foreach target : target_dirs
 
   if target.endswith('-softmmu')
     execs = [{
-      'name': 'qemu-system-' + target_name,
+      'name': 'lats-' + target_name,
       'win_subsystem': 'console',
       'sources': files('softmmu/main.c'),
       'dependencies': []
     }]
     if targetos == 'windows' and (sdl.found() or gtk.found())
       execs += [{
-        'name': 'qemu-system-' + target_name + 'w',
+        'name': 'lats-' + target_name + 'w',
         'win_subsystem': 'windows',
         'sources': files('softmmu/main.c'),
         'dependencies': []
@@ -3802,7 +3828,7 @@ foreach target : target_dirs
     if get_option('fuzzing')
       specific_fuzz = specific_fuzz_ss.apply(config_target, strict: false)
       execs += [{
-        'name': 'qemu-fuzz-' + target_name,
+        'name': 'lats-fuzz-' + target_name,
         'win_subsystem': 'console',
         'sources': specific_fuzz.sources(),
         'dependencies': specific_fuzz.dependencies(),
@@ -3810,7 +3836,7 @@ foreach target : target_dirs
     endif
   else
     execs = [{
-      'name': 'qemu-' + target_name,
+      'name': 'lats-user-' + target_name,
       'win_subsystem': 'console',
       'sources': [],
       'dependencies': []
@@ -3945,7 +3971,10 @@ subdir('scripts')
 subdir('tools')
 subdir('pc-bios')
 subdir('docs')
-subdir('tests')
+#subdir('tests')
+if is_variable('capStone')
+  subdir('tests/latx')
+endif
 if gtk.found()
   subdir('po')
 endif

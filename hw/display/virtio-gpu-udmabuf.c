@@ -167,6 +167,16 @@ static void virtio_gpu_free_dmabuf(VirtIOGPU *g, VGPUDMABuf *dmabuf)
     g_free(dmabuf);
 }
 
+void virtio_gpu_release_scanout_dmabuf(VirtIOGPU *g, int scanout_id)
+{
+    VGPUDMABuf *dmabuf = g->dmabuf.primary[scanout_id];
+
+    if (dmabuf) {
+        g->dmabuf.primary[scanout_id] = NULL;
+        virtio_gpu_free_dmabuf(g, dmabuf);
+    }
+}
+
 static VGPUDMABuf
 *virtio_gpu_create_dmabuf(VirtIOGPU *g,
                           uint32_t scanout_id,

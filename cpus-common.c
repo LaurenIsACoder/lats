@@ -83,7 +83,7 @@ unsigned int cpu_list_generation_id_get(void)
 
 void cpu_list_add(CPUState *cpu)
 {
-    QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
+    QEMU_LOCK_GUARD_1(&qemu_cpu_list_lock);
     if (cpu->cpu_index == UNASSIGNED_CPU_INDEX) {
         cpu->cpu_index = cpu_get_free_index();
         assert(cpu->cpu_index != UNASSIGNED_CPU_INDEX);
@@ -96,7 +96,7 @@ void cpu_list_add(CPUState *cpu)
 
 void cpu_list_remove(CPUState *cpu)
 {
-    QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
+    QEMU_LOCK_GUARD_1(&qemu_cpu_list_lock);
     if (!QTAILQ_IN_USE(cpu, node)) {
         /* there is nothing to undo since cpu_exec_init() hasn't been called */
         return;
@@ -144,6 +144,9 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
                    QemuMutex *mutex)
 {
     struct qemu_work_item wi;
+#ifdef CONFIG_LATX_OPT_BQL
+    bool waked = false;
+#endif
 
     if (qemu_cpu_is_self(cpu)) {
         func(cpu, data);
@@ -160,7 +163,17 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
     while (!qatomic_load_acquire(&wi.done)) {
         CPUState *self_cpu = current_cpu;
 
-        qemu_cond_wait(&qemu_work_cond, mutex);
+#ifdef CONFIG_LATX_OPT_BQL
+        pthread_spin_unlock(&mutex->spin);
+        waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, mutex, 10000, true);
+        while (!waked) {
+            qemu_cpu_kick(cpu);
+            waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, mutex, 10000, false);
+        }
+        pthread_spin_lock(&mutex->spin);
+#else
+        qemu_cond_wait_1(&qemu_work_cond, mutex);
+#endif
         current_cpu = self_cpu;
     }
 }
@@ -182,7 +195,7 @@ void async_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
 static inline void exclusive_idle(void)
 {
     while (pending_cpus) {
-        qemu_cond_wait(&exclusive_resume, &qemu_cpu_list_lock);
+        qemu_cond_wait_1(&exclusive_resume, &qemu_cpu_list_lock);
     }
 }
 
@@ -198,7 +211,7 @@ void start_exclusive(void)
         return;
     }
 
-    qemu_mutex_lock(&qemu_cpu_list_lock);
+    qemu_mutex_lock_1(&qemu_cpu_list_lock);
     exclusive_idle();
 
     /* Make all other cpus stop executing.  */
@@ -215,15 +228,17 @@ void start_exclusive(void)
         }
     }
 
+	smp_mb();
     qatomic_set(&pending_cpus, running_cpus + 1);
+	smp_mb();
     while (pending_cpus > 1) {
-        qemu_cond_wait(&exclusive_cond, &qemu_cpu_list_lock);
+        qemu_cond_wait_1(&exclusive_cond, &qemu_cpu_list_lock);
     }
 
     /* Can release mutex, no one will enter another exclusive
      * section until end_exclusive resets pending_cpus to 0.
      */
-    qemu_mutex_unlock(&qemu_cpu_list_lock);
+    qemu_mutex_unlock_1(&qemu_cpu_list_lock);
 
     current_cpu->exclusive_context_count = 1;
 }
@@ -236,10 +251,12 @@ void end_exclusive(void)
         return;
     }
 
-    qemu_mutex_lock(&qemu_cpu_list_lock);
+    qemu_mutex_lock_1(&qemu_cpu_list_lock);
+	smp_mb();
     qatomic_set(&pending_cpus, 0);
-    qemu_cond_broadcast(&exclusive_resume);
-    qemu_mutex_unlock(&qemu_cpu_list_lock);
+	smp_mb();
+    qemu_cond_broadcast_1(&exclusive_resume);
+    qemu_mutex_unlock_1(&qemu_cpu_list_lock);
 }
 
 /* Wait for exclusive ops to finish, and begin cpu execution.  */
@@ -264,7 +281,7 @@ void cpu_exec_start(CPUState *cpu)
      * see cpu->running == true, and it will kick the CPU.
      */
     if (unlikely(qatomic_read(&pending_cpus))) {
-        QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
+        QEMU_LOCK_GUARD_1(&qemu_cpu_list_lock);
         if (!cpu->has_waiter) {
             /* Not counted in pending_cpus, let the exclusive item
              * run.  Since we have the lock, just set cpu->running to true
@@ -306,12 +323,14 @@ void cpu_exec_end(CPUState *cpu)
      * next cpu_exec_start.
      */
     if (unlikely(qatomic_read(&pending_cpus))) {
-        QEMU_LOCK_GUARD(&qemu_cpu_list_lock);
+        QEMU_LOCK_GUARD_1(&qemu_cpu_list_lock);
         if (cpu->has_waiter) {
             cpu->has_waiter = false;
+	smp_mb();
             qatomic_set(&pending_cpus, pending_cpus - 1);
+	smp_mb();
             if (pending_cpus == 1) {
-                qemu_cond_signal(&exclusive_cond);
+                qemu_cond_signal_1(&exclusive_cond);
             }
         }
     }
@@ -367,7 +386,7 @@ void process_queued_cpu_work(CPUState *cpu)
         }
     }
     qemu_mutex_unlock(&cpu->work_mutex);
-    qemu_cond_broadcast(&qemu_work_cond);
+    qemu_cond_broadcast_1(&qemu_work_cond);
 }
 
 /* Add a breakpoint.  */

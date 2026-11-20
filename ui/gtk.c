@@ -192,6 +192,7 @@ static bool gd_grab_on_hover(GtkDisplayState *s)
 static void gd_update_cursor(VirtualConsole *vc)
 {
     GtkDisplayState *s = vc->s;
+    GdkCursor *cursor = NULL;
     GdkWindow *window;
 
     if (vc->type != GD_VC_GFX ||
@@ -205,10 +206,10 @@ static void gd_update_cursor(VirtualConsole *vc)
 
     window = gtk_widget_get_window(GTK_WIDGET(vc->gfx.drawing_area));
     if (s->full_screen || qemu_input_is_absolute() || s->ptr_owner == vc) {
-        gdk_window_set_cursor(window, s->null_cursor);
-    } else {
-        gdk_window_set_cursor(window, NULL);
+        cursor = vc->gfx.guest_cursor_visible && vc->gfx.guest_cursor ?
+            vc->gfx.guest_cursor : s->null_cursor;
     }
+    gdk_window_set_cursor(window, cursor);
 }
 
 static void gd_update_caption(GtkDisplayState *s)
@@ -221,9 +222,9 @@ static void gd_update_caption(GtkDisplayState *s)
     int i;
 
     if (qemu_name) {
-        prefix = g_strdup_printf("QEMU (%s)", qemu_name);
+        prefix = g_strdup_printf("LATX-SYS (%s)", qemu_name);
     } else {
-        prefix = g_strdup_printf("QEMU");
+        prefix = g_strdup_printf("LATX-SYS");
     }
 
     if (s->ptr_owner != NULL &&
@@ -449,22 +450,10 @@ static void gd_mouse_set(DisplayChangeListener *dcl,
                          int x, int y, int visible)
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
-    GdkDisplay *dpy;
-    gint x_root, y_root;
 
-    if (!gtk_widget_get_realized(vc->gfx.drawing_area) ||
-        qemu_input_is_absolute()) {
-        return;
-    }
-
-    dpy = gtk_widget_get_display(vc->gfx.drawing_area);
-    gdk_window_get_root_coords(gtk_widget_get_window(vc->gfx.drawing_area),
-                               x, y, &x_root, &y_root);
-    gdk_device_warp(gd_get_pointer(dpy),
-                    gtk_widget_get_screen(vc->gfx.drawing_area),
-                    x_root, y_root);
-    vc->s->last_x = x;
-    vc->s->last_y = y;
+    vc->gfx.guest_cursor_visible = visible &&
+        !(x == 0xdeadbeaf && y == 0xdeadbeaf);
+    gd_update_cursor(vc);
 }
 
 static void gd_cursor_define(DisplayChangeListener *dcl,
@@ -474,10 +463,6 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
     GdkPixbuf *pixbuf;
     GdkCursor *cursor;
 
-    if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
-        return;
-    }
-
     pixbuf = gdk_pixbuf_new_from_data((guchar *)(c->data),
                                       GDK_COLORSPACE_RGB, true, 8,
                                       c->width, c->height, c->width * 4,
@@ -485,9 +470,10 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
     cursor = gdk_cursor_new_from_pixbuf
         (gtk_widget_get_display(vc->gfx.drawing_area),
          pixbuf, c->hot_x, c->hot_y);
-    gdk_window_set_cursor(gtk_widget_get_window(vc->gfx.drawing_area), cursor);
     g_object_unref(pixbuf);
-    g_object_unref(cursor);
+    g_clear_object(&vc->gfx.guest_cursor);
+    vc->gfx.guest_cursor = cursor;
+    gd_update_cursor(vc);
 }
 
 static void gd_switch(DisplayChangeListener *dcl,
@@ -1549,18 +1535,16 @@ static void gd_grab_update(VirtualConsole *vc, bool kbd, bool ptr)
     GdkSeat *seat = gdk_display_get_default_seat(display);
     GdkWindow *window = gtk_widget_get_window(vc->gfx.drawing_area);
     GdkSeatCapabilities caps = 0;
-    GdkCursor *cursor = NULL;
 
     if (kbd) {
         caps |= GDK_SEAT_CAPABILITY_KEYBOARD;
     }
     if (ptr) {
         caps |= GDK_SEAT_CAPABILITY_ALL_POINTING;
-        cursor = vc->s->null_cursor;
     }
 
     if (caps) {
-        gdk_seat_grab(seat, window, caps, false, cursor,
+        gdk_seat_grab(seat, window, caps, false, NULL,
                       NULL, NULL, NULL);
     } else {
         gdk_seat_ungrab(seat);
@@ -1615,6 +1599,7 @@ static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
     gdk_device_get_position(gd_get_pointer(display),
                             NULL, &vc->s->grab_x_root, &vc->s->grab_y_root);
     vc->s->ptr_owner = vc;
+    gd_update_cursor(vc);
     gd_update_caption(vc->s);
     trace_gd_grab(vc->label, "ptr", reason);
 }
@@ -1634,6 +1619,7 @@ static void gd_ungrab_pointer(GtkDisplayState *s)
     gdk_device_warp(gd_get_pointer(display),
                     gtk_widget_get_screen(vc->gfx.drawing_area),
                     vc->s->grab_x_root, vc->s->grab_y_root);
+    gd_update_cursor(vc);
     gd_update_caption(s);
     trace_gd_ungrab(vc->label, "ptr");
 }
@@ -2434,6 +2420,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
             break;
         }
         gtk_widget_realize(s->vc[idx].gfx.drawing_area);
+        gd_update_cursor(&s->vc[idx]);
     }
 
     if (opts->u.gtk.has_show_menubar &&

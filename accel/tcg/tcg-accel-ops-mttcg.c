@@ -30,16 +30,153 @@
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
+#include "qemu/cutils.h"
 #include "exec/exec-all.h"
 #include "hw/boards.h"
 #include "tcg/tcg.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-mttcg.h"
 
+#include "latx-sys-env-init-func.h"
+#include "latx-sigfpe-sys.h"
+#include "latx-ras.h"
+#include "hamt-cpu.h"
+#include "hamt-enter.h"
+#include "hamt-options.h"
+#include "latx-sigrt-sys.h"
+
 typedef struct MttcgForceRcuNotifier {
     Notifier notifier;
     CPUState *cpu;
 } MttcgForceRcuNotifier;
+
+typedef struct HamtHostCPU {
+    int id;
+    int package_id;
+    int core_id;
+    bool primary_thread;
+} HamtHostCPU;
+
+static gsize hamt_taskset_topology_initialized;
+static int hamt_taskset_cpus[CPU_SETSIZE];
+static int hamt_taskset_nosmt_cpus[CPU_SETSIZE];
+static int hamt_taskset_cpu_count;
+static int hamt_taskset_nosmt_cpu_count;
+
+static bool hamt_read_topology_id(int cpu, const char *name, int *value)
+{
+    g_autofree char *path = g_strdup_printf(
+        "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, name);
+    g_autofree char *contents = NULL;
+    const char *end;
+
+    if (!g_file_get_contents(path, &contents, NULL, NULL)) {
+        return false;
+    }
+
+    if (qemu_strtoi(contents, &end, 10, value) < 0 || *value < 0) {
+        return false;
+    }
+    while (g_ascii_isspace(*end)) {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+    return true;
+}
+
+static void hamt_init_taskset_topology(void)
+{
+    HamtHostCPU host_cpus[CPU_SETSIZE];
+    cpu_set_t allowed;
+    int nr_host_cpus = 0;
+    bool topology_complete = true;
+
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) < 0) {
+        fprintf(stderr, "HAMT taskset: sched_getaffinity failed: %s\n",
+                strerror(errno));
+        return;
+    }
+
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        HamtHostCPU *host_cpu;
+
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+
+        host_cpu = &host_cpus[nr_host_cpus++];
+        host_cpu->id = cpu;
+        hamt_taskset_cpus[nr_host_cpus - 1] = cpu;
+        host_cpu->primary_thread = true;
+        if (!hamt_read_topology_id(cpu, "physical_package_id",
+                                   &host_cpu->package_id) ||
+            !hamt_read_topology_id(cpu, "core_id", &host_cpu->core_id)) {
+            topology_complete = false;
+            host_cpu->package_id = 0;
+            host_cpu->core_id = cpu;
+        }
+
+        for (int i = 0; i < nr_host_cpus - 1; i++) {
+            if (host_cpus[i].package_id == host_cpu->package_id &&
+                host_cpus[i].core_id == host_cpu->core_id) {
+                host_cpu->primary_thread = false;
+                break;
+            }
+        }
+    }
+
+    if (nr_host_cpus == 0) {
+        fprintf(stderr, "HAMT taskset: no CPU is available\n");
+        return;
+    }
+
+    if (!topology_complete) {
+        fprintf(stderr, "HAMT taskset: incomplete sysfs topology; "
+                "treating each logical CPU as a separate core\n");
+        for (int i = 0; i < nr_host_cpus; i++) {
+            host_cpus[i].primary_thread = true;
+        }
+    }
+
+    /* Use one thread per physical core before assigning SMT siblings. */
+    for (int i = 0; i < nr_host_cpus; i++) {
+        if (host_cpus[i].primary_thread) {
+            hamt_taskset_nosmt_cpus[hamt_taskset_nosmt_cpu_count++] =
+                host_cpus[i].id;
+        }
+    }
+    for (int i = 0; i < nr_host_cpus; i++) {
+        if (!host_cpus[i].primary_thread) {
+            hamt_taskset_nosmt_cpus[hamt_taskset_nosmt_cpu_count++] =
+                host_cpus[i].id;
+        }
+    }
+
+    hamt_taskset_cpu_count = nr_host_cpus;
+}
+
+static int hamt_taskset_cpu(int vcpu_index, bool nosmt)
+{
+    int *cpus;
+    int nr_cpus;
+
+    if (g_once_init_enter(&hamt_taskset_topology_initialized)) {
+        hamt_init_taskset_topology();
+        g_once_init_leave(&hamt_taskset_topology_initialized, 1);
+    }
+
+    cpus = nosmt ? hamt_taskset_nosmt_cpus : hamt_taskset_cpus;
+    nr_cpus = nosmt ? hamt_taskset_nosmt_cpu_count : hamt_taskset_cpu_count;
+    if (nr_cpus == 0) {
+        return -1;
+    }
+
+    /* Once every cached CPU is used, sharing CPUs is unavoidable. */
+    return cpus[vcpu_index % nr_cpus];
+}
 
 static void do_nothing(CPUState *cpu, run_on_cpu_data d)
 {
@@ -62,10 +199,35 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
  * current CPUState for a given thread.
  */
 
+#include "latx/include/latx-native-asm.h"
 static void *mttcg_cpu_thread_fn(void *arg)
 {
     MttcgForceRcuNotifier force_rcu;
     CPUState *cpu = arg;
+
+    if (hamt_do_taskset()) {
+        pthread_t tid = pthread_self();
+        assert(tid == cpu->thread->thread);
+        int host_cpu = hamt_taskset_cpu(cpu->cpu_index,
+                                        hamt_do_taskset_nosmt());
+        cpu_set_t cpuset;
+        int ret;
+
+        g_assert(host_cpu >= 0);
+        CPU_ZERO(&cpuset);
+        CPU_SET(host_cpu, &cpuset);
+        ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+        if (ret != 0) {
+            fprintf(stderr,
+                    "HAMT taskset: failed to bind vCPU %d to host CPU %d: %s\n",
+                    cpu->cpu_index, host_cpu, strerror(ret));
+            g_assert_not_reached();
+        }
+        printf("MTTCG enter HAMT taskset vcpu %d host cpu %d "
+               "pthread_t 0x%lx%s\n",
+               cpu->cpu_index, host_cpu, (uint64_t)tid,
+               hamt_do_taskset_nosmt() ? " nosmt" : "");
+    }
 
     assert(tcg_enabled());
     g_assert(!icount_enabled());
@@ -87,12 +249,25 @@ static void *mttcg_cpu_thread_fn(void *arg)
 
     /* process any pending work */
     cpu->exit_request = 1;
+    if (qemu_tcg_mode_2_lat()) {
+        latx_lsenv_init(cpu->env_ptr);
+        latxs_init_rr_thread_sigfpe(cpu);
+        lats_init_rr_thread_sigrtmin(cpu);
+        /*latxs_init_rr_thread_sigsegv(cpu);*/
+    }
+
+    cpu_enter_hamt(cpu, HAMT_MODE_MT, cpu->cpu_index);
 
     do {
         if (cpu_can_run(cpu)) {
             int r;
             qemu_mutex_unlock_iothread();
             r = tcg_cpus_exec(cpu);
+#ifdef CONFIG_LATX_OPT_NOFP
+            if (qemu_tcg_mode_2_lat()) {
+                __nofp_sync_fpr_to_env(cpu, 0);
+            }
+#endif
             qemu_mutex_lock_iothread();
             switch (r) {
             case EXCP_DEBUG:

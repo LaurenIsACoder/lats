@@ -191,6 +191,11 @@ struct qht_map {
 #endif
 };
 
+size_t qht_n_buckets(struct qht *ht)
+{
+    return ht ? ht->map ? ht->map->n_buckets : 0: 0;
+}
+
 /* trigger a resize when n_added_buckets > n_buckets / div */
 #define QHT_NR_ADDED_BUCKETS_THRESHOLD_DIV 8
 
@@ -293,6 +298,20 @@ static inline void qht_bucket_unlock(struct qht_map *map,
                                      struct qht_bucket *b)
 {
     qht_bucket_lock_do(map, b, qemu_spin_unlock);
+}
+
+/* Like qemu_spin_trylock(), returns true when the lock is busy. */
+static inline bool qht_bucket_trylock(struct qht_map *map,
+                                      struct qht_bucket *b)
+{
+#ifdef CONFIG_TSAN
+    unsigned long bucket_idx = b - map->buckets;
+    unsigned long lock_idx = bucket_idx & (QHT_TSAN_BUCKET_LOCKS - 1);
+
+    return qemu_spin_trylock(&map->tsan_bucket_locks[lock_idx].lock);
+#else
+    return qemu_spin_trylock(&b->lock);
+#endif
 }
 
 static inline void qht_head_init(struct qht_map *map, struct qht_bucket *b)
@@ -886,6 +905,36 @@ void qht_iter(struct qht *ht, qht_iter_func_t func, void *userp)
     };
 
     do_qht_iter(ht, &iter, userp);
+}
+
+size_t qht_iter_try(struct qht *ht, qht_iter_func_t func, void *userp)
+{
+    const struct qht_iter iter = {
+        .f.retvoid = func,
+        .type = QHT_ITER_VOID,
+    };
+    struct qht_map *map;
+    size_t skipped = 0;
+
+    rcu_read_lock();
+    map = qatomic_rcu_read(&ht->map);
+    if (!map) {
+        rcu_read_unlock();
+        return 0;
+    }
+
+    for (size_t i = 0; i < map->n_buckets; i++) {
+        struct qht_bucket *bucket = &map->buckets[i];
+
+        if (qht_bucket_trylock(map, bucket)) {
+            skipped++;
+            continue;
+        }
+        qht_bucket_iter(bucket, &iter, userp);
+        qht_bucket_unlock(map, bucket);
+    }
+    rcu_read_unlock();
+    return skipped;
 }
 
 void qht_iter_remove(struct qht *ht, qht_iter_bool_func_t func, void *userp)

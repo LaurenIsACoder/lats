@@ -31,6 +31,10 @@
 #include "hw/i386/apic-msidef.h"
 #include "qapi/error.h"
 #include "qom/object.h"
+#include "latx/include/latx-options.h"
+#include "htimer.h"
+#include "dune-kvm-init-value.h"
+#include "latx-sigrt-sys.h"
 
 #define MAX_APICS 255
 #define MAX_APIC_WORDS 8
@@ -96,7 +100,7 @@ static void apic_sync_vapic(APICCommonState *s, int sync_type)
     if (sync_type & SYNC_FROM_VAPIC) {
         cpu_physical_memory_read(s->vapic_paddr, &vapic_state,
                                  sizeof(vapic_state));
-        s->tpr = vapic_state.tpr;
+        s->cpu->env.tpr = vapic_state.tpr;
     }
     if (sync_type & (SYNC_TO_VAPIC | SYNC_ISR_IRR_TO_VAPIC)) {
         start = offsetof(VAPICState, isr);
@@ -105,7 +109,7 @@ static void apic_sync_vapic(APICCommonState *s, int sync_type)
         if (sync_type & SYNC_TO_VAPIC) {
             assert(qemu_cpu_is_self(CPU(s->cpu)));
 
-            vapic_state.tpr = s->tpr;
+            vapic_state.tpr = s->cpu->env.tpr;
             vapic_state.enabled = 1;
             start = 0;
             length = sizeof(VAPICState);
@@ -166,6 +170,13 @@ static void apic_local_deliver(APICCommonState *s, int vector)
             (lvt & APIC_LVT_LEVEL_TRIGGER))
             trigger_mode = APIC_TRIGGER_LEVEL;
         apic_set_irq(s, lvt & 0xff, trigger_mode);
+#ifdef HTIMER_DEBUG
+        if (vector == APIC_LVT_TIMER) {
+            CPUState *cpu = CPU(s->cpu);
+            HTIMER_LOG("[disable-htimer][cpu%d] %s\n",
+                        cpu->cpu_index, __func__);
+        }
+#endif
     }
 }
 
@@ -300,12 +311,22 @@ static void apic_set_base(APICCommonState *s, uint64_t val)
     }
 }
 
+static int apic_irq_pending_fast_tpr(APICCommonState *s, int tpr);
+static int apic_irq_pending(APICCommonState *s);
 static void apic_set_tpr(APICCommonState *s, uint8_t val)
 {
-    /* Updates from cr8 are ignored while the VAPIC is active */
-    if (!s->vapic_paddr) {
-        s->tpr = val << 4;
-        apic_update_irq(s);
+	int tpr = val << 4;
+    s->cpu->env.tpr = tpr;
+    CPUState *cpu;
+    cpu = CPU(s->cpu);
+
+    int irq_fast = apic_irq_pending_fast_tpr(s, tpr);
+    if (irq_fast > 0) {
+        qatomic_or(&cpu->interrupt_request, CPU_INTERRUPT_HARD);
+        /* keep the request ordered before the exit flag (weak hosts) */
+        smp_wmb();
+        lats_send_sigrtmin(cpu);
+        qatomic_set(&cpu_neg(cpu)->icount_decr.u16.high, -1);
     }
 }
 
@@ -323,21 +344,24 @@ int apic_get_highest_priority_irr(DeviceState *dev)
 
 static uint8_t apic_get_tpr(APICCommonState *s)
 {
-    apic_sync_vapic(s, SYNC_FROM_VAPIC);
-    return s->tpr >> 4;
+//    apic_sync_vapic(s, SYNC_FROM_VAPIC);
+    return s->cpu->env.tpr >> 4;
 }
 
 int apic_get_ppr(APICCommonState *s)
 {
     int tpr, isrv, ppr;
 
-    tpr = (s->tpr >> 4);
+    tpr = (s->cpu->env.tpr >> 4);
     isrv = get_highest_priority_int(s->isr);
-    if (isrv < 0)
+    s->cpu->env.isrv = isrv&0xf0;
+    if (isrv < 0) {
         isrv = 0;
+        s->cpu->env.isrv = 0;
+    }
     isrv >>= 4;
     if (tpr >= isrv)
-        ppr = s->tpr;
+        ppr = s->cpu->env.tpr;
     else
         ppr = isrv << 4;
     return ppr;
@@ -355,6 +379,24 @@ static int apic_get_arb_pri(APICCommonState *s)
  * 0  - no interrupt,
  * >0 - interrupt number
  */
+static int apic_irq_pending_fast_tpr(APICCommonState *s, int tpr)
+{
+    int irrv, ppr;
+    irrv = s->cpu->env.irrv;
+    if (irrv < 0) {
+        return 0;
+    }
+    ppr = s->cpu->env.isrv;
+    if (tpr >= ppr)
+        ppr = tpr;
+
+    if (ppr && (irrv & 0xf0) <= (ppr & 0xf0)) {
+        return -1;
+    }
+
+    return irrv;
+}
+
 static int apic_irq_pending(APICCommonState *s)
 {
     int irrv, ppr;
@@ -364,6 +406,7 @@ static int apic_irq_pending(APICCommonState *s)
     }
 
     irrv = get_highest_priority_int(s->irr);
+    s->cpu->env.irrv = irrv;
     if (irrv < 0) {
         return 0;
     }
@@ -375,7 +418,6 @@ static int apic_irq_pending(APICCommonState *s)
     return irrv;
 }
 
-/* signal the CPU if an irq is pending */
 static void apic_update_irq(APICCommonState *s)
 {
     CPUState *cpu;
@@ -388,6 +430,47 @@ static void apic_update_irq(APICCommonState *s)
         cpu_interrupt(cpu, CPU_INTERRUPT_HARD);
     } else if (!apic_accept_pic_intr(dev) || !pic_get_output(isa_pic)) {
         cpu_reset_interrupt(cpu, CPU_INTERRUPT_HARD);
+    }
+}
+
+void apic_local_deliver_timer(void)
+{
+    DeviceState *dev;
+    APICCommonState *s;
+    CPUState *cpu;
+
+    dev = cpu_get_current_apic();
+    if (!dev) {
+        HTIMER_LOG("%s ERROR dev NULL!\n", __func__);
+        return;
+    }
+    s = APIC(dev);
+    cpu = CPU(s->cpu);
+    HTIMER_LOG("[cpu%d] %s\n", cpu->cpu_index, __func__);
+
+    uint32_t lvt = s->lvt[APIC_LVT_TIMER];
+    int vector_num;
+
+    if (lvt & APIC_LVT_MASKED)
+        return;
+
+    assert(((lvt >> 8) & 7) == APIC_DM_FIXED);
+
+    vector_num = lvt & 0xff;
+    apic_set_bit(s->irr, vector_num);
+    apic_reset_bit(s->tmr, vector_num);
+    if (apic_irq_pending(s) > 0) {
+        if (!qemu_cpu_is_self(cpu)) {
+            g_assert(0);
+        } else {
+            qatomic_or(&cpu->interrupt_request, CPU_INTERRUPT_HARD);
+            /* keep the request ordered before the exit flag (weak hosts) */
+            smp_wmb();
+            lats_send_sigrtmin(cpu);
+            qatomic_set(&cpu_neg(cpu)->icount_decr.u16.high, -1);
+        }
+    } else if (!apic_accept_pic_intr(dev) || !pic_get_output(isa_pic)) {
+        cpu->interrupt_request &= ~CPU_INTERRUPT_HARD;
     }
 }
 
@@ -652,6 +735,9 @@ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     s = APIC(dev);
+#ifdef HTIMER_DEBUG
+    CPUState *cpu = CPU(s->cpu);
+#endif
 
     index = (addr >> 4) & 0xff;
     switch(index) {
@@ -666,7 +752,7 @@ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
         if (apic_report_tpr_access) {
             cpu_report_tpr_access(&s->cpu->env, TPR_ACCESS_READ);
         }
-        val = s->tpr;
+        val = s->cpu->env.tpr;
         break;
     case 0x09:
         val = apic_get_arb_pri(s);
@@ -710,7 +796,17 @@ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
         val = s->initial_count;
         break;
     case 0x39:
-        val = apic_get_current_count(s);
+    /*
+     * Refer to Intel SDM vol.3A Table 12-1:
+     *     FEE0 0390H | Current Count Register (for Timer) | Read Only
+     */
+        if (option_htimer) {
+            val = get_current_count_from_timertick(s);
+        } else {
+            val = apic_get_current_count(s);
+            HTIMER_LOG("[disable-htimer][cpu%d] %s read x86_count = 0x%x\n",
+                        cpu->cpu_index, __func__, val);
+        }
         break;
     case 0x3e:
         val = s->divide_conf;
@@ -747,6 +843,8 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
     if (size < 4) {
         return;
     }
+    /*printf("%s:%d addr %016lx val %lx size %x\n", __func__, __LINE__,*/
+            /*addr, val, size);*/
 
     if (addr > 0xfff || !index) {
         /* MSI and MMIO APIC are at the same memory location,
@@ -764,6 +862,9 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
     s = APIC(dev);
+#ifdef HTIMER_DEBUG
+    CPUState *cpu = CPU(s->cpu);
+#endif
 
     trace_apic_mem_writel(addr, val);
 
@@ -777,7 +878,7 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         if (apic_report_tpr_access) {
             cpu_report_tpr_access(&s->cpu->env, TPR_ACCESS_WRITE);
         }
-        s->tpr = val;
+        s->cpu->env.tpr = val;
         apic_sync_vapic(s, SYNC_TO_VAPIC);
         apic_update_irq(s);
         break;
@@ -812,20 +913,45 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         s->icr[1] = val;
         break;
     case 0x32 ... 0x37:
+    /*
+     * Refer to Intel SDM vol.3A 12.5.1:
+     *     FEE0 0320H : LVT Timer Register
+     *     FEE0 0330H : LVT Thermal Monitor Register
+     *     FEE0 0340H : LVT Performance Counter Register
+     *     FEE0 0350H : LVT LINT0 Register
+     *     FEE0 0360H : LVT LINT1 Register
+     *     FEE0 0370H : LVT Error Register
+     */
         {
             int n = index - 0x32;
             s->lvt[n] = val;
             if (n == APIC_LVT_TIMER) {
-                apic_timer_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                if (option_htimer) {
+                    update_tcfg(s);
+                } else {
+                    HTIMER_LOG("[disable-htimer][cpu%d] %s lvtt = 0x%lx\n",
+                                cpu->cpu_index, __func__, val);
+                    apic_timer_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                }
             } else if (n == APIC_LVT_LINT0 && apic_check_pic(s)) {
                 apic_update_irq(s);
             }
         }
         break;
     case 0x38:
+    /*
+     * Refer to Intel SDM vol.3A Table 12-1:
+     *     FEE0 0380H | Initial Count Register (for Timer) | Read/Write
+     */
         s->initial_count = val;
-        s->initial_count_load_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        apic_timer_update(s, s->initial_count_load_time);
+        if (option_htimer) {
+            update_tcfg(s);
+        } else {
+            HTIMER_LOG("[disable-htimer][cpu%d] %s initial_count = 0x%x\n",
+                        cpu->cpu_index, __func__, s->initial_count);
+            s->initial_count_load_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            apic_timer_update(s, s->initial_count_load_time);
+        }
         break;
     case 0x39:
         break;
@@ -841,6 +967,12 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val,
         s->esr |= APIC_ESR_ILLEGAL_ADDRESS;
         break;
     }
+}
+
+void latx_apic_mem_write_locked(uint64_t addr, uint64_t val, unsigned size);
+void latx_apic_mem_write_locked(uint64_t addr, uint64_t val, unsigned size)
+{
+    apic_mem_write(NULL, addr, val, size);
 }
 
 static void apic_pre_save(APICCommonState *s)
@@ -893,6 +1025,9 @@ static void apic_realize(DeviceState *dev, Error **errp)
     s->io_memory.disable_reentrancy_guard = true;
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apic_timer, s);
+    if (option_htimer) {
+        s->la_ecfg = INIT_VALUE_ECFG;
+    }
     local_apics[s->id] = s;
 
     msi_nonbroken = true;

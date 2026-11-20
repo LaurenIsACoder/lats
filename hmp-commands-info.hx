@@ -122,6 +122,14 @@ ERST
 
         .cmd        = hmp_info_local_apic,
     },
+
+    {
+        .name       = "latx-irq",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show per-CPU latx interrupt/exit state",
+        .cmd        = hmp_info_latx_irq,
+    },
 #endif
 
 SRST
@@ -241,18 +249,40 @@ ERST
 
     {
         .name       = "mtree",
-        .args_type  = "flatview:-f,dispatch_tree:-d,owner:-o,disabled:-D",
-        .params     = "[-f][-d][-o][-D]",
+        .args_type  = "flatview:-f,dispatch_tree:-d,owner:-o,disabled:-D,ramblock:-r",
+        .params     = "[-f][-d][-o][-D][-r]",
         .help       = "show memory tree (-f: dump flat view for address spaces;"
                       "-d: dump dispatch tree, valid with -f only);"
                       "-o: dump region owners/parents;"
                       "-D: dump disabled regions",
+                      "-r: dump ramblock",
         .cmd        = hmp_info_mtree,
     },
 
 SRST
   ``info mtree``
     Show memory tree.
+ERST
+
+    {
+        .name = "qcprofile",
+        .args_type = "show:-s,splitsort:-S,tbprofile:-t,tbprofilebytime:-T,tbprofilebyavgtime:-A,tbprofilebytlbrtime:-r,tbprofilebytlbrtimep:-R,tuprofilebytime:-U",
+        .params = "[-s][-S][-n][-t][-T][-A][-r][-R][-n][-U]\n",
+        .help = "switch qemu counter profile stat\n"
+                "-s: print stat only (no change)\n"
+                "-S: hot tb profile split sort\n"
+                "-t: hot tb profile\n"
+                "-T: hot tb profile sort by tb-rdtime\n"
+                "-A: hot tb profile sort by avg-tb-rdtime\n"
+                "-r: hot tb profile sort by tb-tlbr-rdtime\n"
+                "-R: hot tb profile sort by tb-tlbr-rdtime/tb-rdtime"
+                "-U: hot tb(in tu) profile sort by tb-rdtime",
+        .cmd = hmp_info_qcprofile,
+    },
+
+SRST
+  ``info qcprofile``
+    Show qemu counter profile stat.
 ERST
 
 #if defined(CONFIG_TCG)

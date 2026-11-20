@@ -96,7 +96,7 @@ bool qnum_get_try_int(const QNum *qn, int64_t *val)
  */
 int64_t qnum_get_int(const QNum *qn)
 {
-    int64_t val;
+    int64_t val = 0;
     bool success = qnum_get_try_int(qn, &val);
     assert(success);
     return val;
@@ -134,7 +134,7 @@ bool qnum_get_try_uint(const QNum *qn, uint64_t *val)
  */
 uint64_t qnum_get_uint(const QNum *qn)
 {
-    uint64_t val;
+    uint64_t val = 0;
     bool success = qnum_get_try_uint(qn, &val);
     assert(success);
     return val;

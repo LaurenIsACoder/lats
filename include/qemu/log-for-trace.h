@@ -26,7 +26,17 @@ extern int qemu_loglevel;
 /* Returns true if a bit is set in the current loglevel mask */
 static inline bool qemu_loglevel_mask(int mask)
 {
+#ifdef NDEBUG
+    /*
+     * Keep explicitly selected trace events usable in release builds.  The
+     * log backend tests LOG_TRACE here after checking the event's state.
+     * All other masks must still fold to false, so expensive debug arguments
+     * and their hot-path formatting remain compiled out.
+     */
+    return (qemu_loglevel & mask & LOG_TRACE) != 0;
+#else
     return (qemu_loglevel & mask) != 0;
+#endif
 }
 
 /* main logging function */

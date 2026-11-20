@@ -25,6 +25,7 @@
 #include "exec/cpu_ldst.h"
 #include "tcg/helper-tcg.h"
 #include "../seg_helper.h"
+#include "latx/include/latx-native-asm.h"
 
 void helper_syscall(CPUX86State *env, int next_eip_addend)
 {
@@ -138,6 +139,12 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         return false;
     }
 
+#ifdef CONFIG_LATX_OPT_NOFP
+    if (qemu_tcg_mode_2_lat()) {
+        __nofp_sync_xmm_to_env((CPUState *)cpu);
+        __nofp_sync_fpr_to_env((CPUState *)cpu, 0);
+    }
+#endif
     /* Don't process multiple interrupt requests in a single call.
      * This is required to make icount-driven execution deterministic.
      */
