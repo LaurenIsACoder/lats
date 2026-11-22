@@ -1261,6 +1261,12 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 
     assert_memory_lock();
 
+#ifdef CONFIG_LATX_TU
+    if (tb_is_lookup_private(tb) && (orig_cflags & CF_INVALID)) {
+        return;
+    }
+#endif
+
     /* make sure no further incoming jumps will be chained to this TB */
     qemu_spin_lock(&tb->jmp_lock);
     uint32_t cflags = (tb->cflags | CF_INVALID) & ~CF_NO_ACTIVE;
@@ -1274,13 +1280,15 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     /* Remove this TB's outgoing software-RAS edge as well. */
     latxs_ras_unlink(tb);
 
-    /* remove the TB from the hash list */
-    phys_pc = tb_page_addr0(tb);
-    h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
-                     tb->flags, tb->cs_base, orig_cflags);
-    flaged_shadow_htable_remove(tb);
-    if (!qht_remove(&tb_ctx.htable[mtcc_id], tb, h)) {
-        return;
+    /* Private members still need page and edge cleanup. */
+    if (!tb_is_lookup_private(tb)) {
+        phys_pc = tb_page_addr0(tb);
+        h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
+                         tb->flags, tb->cs_base, orig_cflags);
+        flaged_shadow_htable_remove(tb);
+        if (!qht_remove(&tb_ctx.htable[mtcc_id], tb, h)) {
+            return;
+        }
     }
 
     /* remove the TB from the page list */
@@ -1361,9 +1369,10 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
  * Returns a pointer @tb, or a pointer to an existing TB that matches @tb.
  * Note that in !user-mode, another thread might have already added a TB
  * for the same block of guest code that @tb corresponds to. In that case,
- * the caller should discard the original @tb, and use instead the returned TB.
+ * the caller should dispatch to the returned TB. Private TU members retain
+ * their local page registrations for branches inside the generated unit.
  */
-TranslationBlock *tb_link_page(TranslationBlock *tb)
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool keep_private)
 {
     void *existing_tb = NULL;
     uint32_t h;
@@ -1389,7 +1398,6 @@ re_insert:
         qht_insert(&tb_ctx.htable[0], tb, h, &existing_tb);
     }
 
-    /* remove TB from the page(s) if we couldn't insert it */
     if (unlikely(existing_tb)) {
         /* Just a test for aot. */
         if (((TranslationBlock *)existing_tb)->cflags & CF_INVALID) {
@@ -1398,6 +1406,14 @@ re_insert:
             fprintf(stderr, "existing_tb is CF_INVALID\n");
             goto re_insert;
         }
+#ifdef CONFIG_LATX_TU
+        if (keep_private) {
+            /* Generated branches and return sites use this member's address. */
+            g_assert(tb_is_tu(tb));
+            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_PRIVATE);
+            return existing_tb;
+        }
+#endif
         tb_remove(tb);
         return existing_tb;
     }

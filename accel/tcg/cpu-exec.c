@@ -320,7 +320,9 @@ static inline void tb_htable_reinsert_fsht(TranslationBlock *tb, vaddr pc,
 #endif
     uint64_t *slot = (uint64_t *)(uintptr_t)fsht[fid].base +
                      (((pc >> 32) ^ phys_pc) & FSHT_MASK);
-    *slot = (uintptr_t)tb;
+    if (!tb_is_lookup_private(tb)) {
+        *slot = (uintptr_t)tb;
+    }
 }
 
 #ifdef CONFIG_LATX_TU
