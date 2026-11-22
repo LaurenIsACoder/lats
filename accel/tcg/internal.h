@@ -114,7 +114,7 @@ void page_init(void);
 void tb_htable_init(void);
 void tb_reset_jump(TranslationBlock *tb, int n);
 void unlink_old_dest(TranslationBlock *tb, TranslationBlock *dest, int n_orig);
-TranslationBlock *tb_link_page(TranslationBlock *tb);
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool keep_private);
 TranslationBlock *aot_tb_link_page(TranslationBlock *tb, bool keep_hras_private);
 #ifdef CONFIG_LATX_TU
 TranslationBlock *aot_tb_replace_page(TranslationBlock *tb,
