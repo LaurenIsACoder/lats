@@ -2007,7 +2007,7 @@ for target in $target_list; do
       ;;
     *-softmmu)
       test -f "$source_path/tests/tcg/$arch/Makefile.softmmu-target" || continue
-      qemu="qemu-system-$arch"
+      qemu="lats-$arch"
       ;;
     *-linux-user|*-bsd-user)
       qemu="qemu-$arch"
