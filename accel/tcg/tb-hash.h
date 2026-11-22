@@ -194,6 +194,9 @@ static inline void tb_jmp_cache_insert(CPUState *cpu, vaddr pc,
     if (tb_cflags(tb) & (CF_NO_GOTO_TB | CF_NO_GOTO_PTR)) {
         return;
     }
+    if (tb_is_lookup_private(tb)) {
+        return;
+    }
     unsigned int hash = tb_jmp_cache_hash(pc);
     CPUJumpCacheEntry *entry = &cpu->tb_jmp_cache->array[hash];
 

@@ -757,7 +757,7 @@ restart_translate:
 #endif
 
     tcg_tb_insert(tb);
-    existing_tb = tb_link_page(tb);
+    existing_tb = tb_link_page(tb, false);
     if (existing_tb != tb) {
         *error = GENCODE_ERR_TB_EXIST;
         lat_tb_discard_code(tcg_ctx, code_gen_start);
@@ -1288,7 +1288,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
      * No explicit memory barrier is required -- tb_link_page() makes the
      * TB visible in a consistent state.
      */
-    existing_tb = tb_link_page(tb);
+    existing_tb = tb_link_page(tb, false);
     tb_unlock_pages(tb);
     assert_no_pages_locked();
 

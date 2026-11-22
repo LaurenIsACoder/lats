@@ -114,7 +114,7 @@ void page_init(void);
 void tb_htable_init(void);
 void tb_reset_jump(TranslationBlock *tb, int n);
 void unlink_old_dest(TranslationBlock *tb, TranslationBlock *dest, int n_orig);
-TranslationBlock *tb_link_page(TranslationBlock *tb);
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool keep_private);
 TranslationBlock *aot_tb_link_page(TranslationBlock *tb);
 TranslationBlock *aot_tb_relink_page(TranslationBlock *tb);
 bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc);

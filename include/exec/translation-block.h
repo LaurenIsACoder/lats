@@ -82,7 +82,8 @@ typedef enum tu_tb_mode_type {
     TU_TB_MODE_BROKEN,
     TU_TB_MODE_STATIC,
     TB_GEN_CODE,
-    BAD_TB
+    BAD_TB,
+    TU_TB_MODE_PRIVATE
 } tu_tb_mode_type;
 #endif
 
@@ -455,9 +456,21 @@ static inline bool tb_is_tu(const TranslationBlock *tb)
     return tb->bool_flags & IS_TU_TB;
 }
 
+/* Owner-local executable code has page and edge ownership but no public key. */
+static inline bool tb_is_lookup_private(const TranslationBlock *tb)
+{
+    return tb_is_tu(tb) &&
+           qatomic_read(&tb->s_data->tu_tb_mode) == TU_TB_MODE_PRIVATE;
+}
+
 static inline uintptr_t tb_tu_identity(const TranslationBlock *tb)
 {
     return (uintptr_t)tb->tc.ptr - tb->tc.offset_in_tu;
+}
+#else
+static inline bool tb_is_lookup_private(const TranslationBlock *tb)
+{
+    return false;
 }
 #endif
 
