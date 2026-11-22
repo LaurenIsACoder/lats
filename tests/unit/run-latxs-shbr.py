@@ -27,10 +27,10 @@ def check_aot_option_activation():
     ]
     try:
         subprocess.run(command, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=2,
+                       stderr=subprocess.STDOUT, timeout=2,
                        check=False)
     except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or ''
+        output = (exc.stdout or b'').decode(errors='replace')
     else:
         raise SystemExit('SHBR AOT option check: QEMU exited too early')
 
