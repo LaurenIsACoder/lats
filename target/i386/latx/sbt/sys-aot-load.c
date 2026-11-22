@@ -3038,7 +3038,7 @@ static bool aot_plain_conflict(CPUState *cpu, TranslationBlock *tb)
 #ifdef CONFIG_SOFTMMU
     return tb && tb->tc.ptr && tcg_tb_has_private_s_data(tb) &&
         tb->size && tb->icount &&
-        !(tb->bool_flags & IS_AOT_TB) && !tb_is_hras_private(tb) &&
+        !(tb->bool_flags & IS_AOT_TB) && !tb_is_lookup_private(tb) &&
         !(tb_cflags(tb) & (CF_INVALID | CF_NO_ACTIVE | CF_PCREL |
                           CF_SINGLE_STEP | CF_USE_ICOUNT | CF_NO_GOTO_TB |
                           CF_NO_GOTO_PTR | CF_NOIRQ | CF_MEMI_ONLY)) &&

@@ -85,7 +85,7 @@ typedef enum tu_tb_mode_type {
     TU_TB_MODE_STATIC,
     TB_GEN_CODE,
     BAD_TB,
-    TU_TB_MODE_HRAS_PRIVATE
+    TU_TB_MODE_PRIVATE
 } tu_tb_mode_type;
 #endif
 
@@ -521,10 +521,10 @@ bool tcg_tb_has_private_s_data(const TranslationBlock *tb);
 
 /* Executable code that owns pages and edges, but no global lookup key.
  * Never read a non-TU's shared translation scratch as persistent state. */
-static inline bool tb_is_hras_private(const TranslationBlock *tb)
+static inline bool tb_is_lookup_private(const TranslationBlock *tb)
 {
     return (tb_is_tu(tb) || tcg_tb_has_private_s_data(tb)) &&
-        qatomic_read(&tb->s_data->tu_tb_mode) == TU_TB_MODE_HRAS_PRIVATE;
+        qatomic_read(&tb->s_data->tu_tb_mode) == TU_TB_MODE_PRIVATE;
 }
 
 static inline uintptr_t tb_tu_identity(const TranslationBlock *tb)

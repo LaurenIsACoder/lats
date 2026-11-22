@@ -1402,7 +1402,7 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 
     assert_memory_lock();
 
-    if (tb_is_hras_private(tb) && (orig_cflags & CF_INVALID)) {
+    if (tb_is_lookup_private(tb) && (orig_cflags & CF_INVALID)) {
         return;
     }
 
@@ -1429,8 +1429,8 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     phys_pc = tb_page_addr0(tb);
     h = tb_hash_func(phys_pc, (orig_cflags & CF_PCREL ? 0 : tb->pc),
                      tb->flags, tb->cs_base, orig_cflags);
-    /* Private return members own pages and edges, but no global hash key. */
-    if (!tb_is_hras_private(tb)) {
+    /* Private TBs own pages and edges, but no global hash key. */
+    if (!tb_is_lookup_private(tb)) {
         flaged_shadow_htable_remove(tb);
         if (!qht_remove(&tb_ctx.htable[mtcc_id], tb, h)) {
             return;
@@ -1515,7 +1515,8 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
  * Returns a pointer @tb, or a pointer to an existing TB that matches @tb.
  * Note that in !user-mode, another thread might have already added a TB
  * for the same block of guest code that @tb corresponds to. In that case,
- * the caller should discard the original @tb, and use instead the returned TB.
+ * the caller should use the returned TB for dispatch. A TU may keep its
+ * local copy on the page lists for branches within the generated unit.
  */
 TranslationBlock *tb_link_page(TranslationBlock *tb, bool keep_private)
 {
@@ -1543,7 +1544,6 @@ re_insert:
         qht_insert(&tb_ctx.htable[0], tb, h, &existing_tb);
     }
 
-    /* remove TB from the page(s) if we couldn't insert it */
     if (unlikely(existing_tb)) {
         /* Just a test for aot. */
         if (((TranslationBlock *)existing_tb)->cflags & CF_INVALID) {
@@ -1553,13 +1553,12 @@ re_insert:
             goto re_insert;
         }
         if (keep_private) {
+            /* Generated branches and return sites use this member's address. */
             g_assert(tb_is_tu(tb));
-            /* Keep the canonical lookup target and this TU's local code.
-             * tb_record above must remain live for SMC and page unmapping. */
-            tb->s_data->tu_tb_mode = TU_TB_MODE_HRAS_PRIVATE;
-            return tb;
+            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_PRIVATE);
+        } else {
+            tb_remove(tb);
         }
-        tb_remove(tb);
         return existing_tb;
     }
 
@@ -1596,7 +1595,7 @@ TranslationBlock *aot_tb_link_page(TranslationBlock *tb, bool keep_hras_private)
             /* The proved paired ordinary TU owns this local continuation.
              * Keep its page/edge registration and the old canonical key. */
             g_assert(tb_is_tu(tb));
-            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_PRIVATE);
             return existing_tb;
         }
         if (((TranslationBlock *)existing_tb)->cflags & CF_INVALID) {
@@ -1636,12 +1635,12 @@ TranslationBlock *aot_tb_replace_page(TranslationBlock *tb,
             (tb_cflags(expected) & (CF_INVALID | CF_NO_ACTIVE)) ||
             (expected->bool_flags & IS_AOT_TB) ||
             !qht_remove(table, expected, h)) {
-            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+            qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_PRIVATE);
             return existing;
         }
         /* Keep every old edge, page-list entry and host-PC registration.
          * The store/load barrier pairs with the C cache insertion recheck. */
-        qatomic_set(&expected->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+        qatomic_set(&expected->s_data->tu_tb_mode, TU_TB_MODE_PRIVATE);
         smp_mb();
         flaged_shadow_htable_remove(expected);
         CPUState *cpu;
@@ -1657,7 +1656,7 @@ TranslationBlock *aot_tb_replace_page(TranslationBlock *tb,
     /* Never displace an object that failed the caller's exact preflight.
      * The full native owner/records and page registration remain valid, even
      * if other members were published before this unexpected collision. */
-    qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_HRAS_PRIVATE);
+    qatomic_set(&tb->s_data->tu_tb_mode, TU_TB_MODE_PRIVATE);
     return existing;
 }
 #endif

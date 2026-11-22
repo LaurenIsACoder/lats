@@ -328,14 +328,14 @@ static inline void tb_htable_reinsert_fsht(TranslationBlock *tb, vaddr pc,
     uint64_t *slot = (uint64_t *)(uintptr_t)fsht[fid].base +
                      (((pc >> 32) ^ phys_pc) & FSHT_MASK);
 #ifdef CONFIG_LATX_TU
-    if (tb_is_hras_private(tb)) {
+    if (tb_is_lookup_private(tb)) {
         return;
     }
 #endif
     qatomic_set(slot, (uintptr_t)tb);
 #ifdef CONFIG_LATX_TU
     smp_mb();
-    if (tb_is_hras_private(tb)) {
+    if (tb_is_lookup_private(tb)) {
         qatomic_cmpxchg(slot, (uintptr_t)tb, 0);
     }
 #endif
@@ -368,7 +368,7 @@ static TranslationBlock *tb_htable_lookup_with_hint(CPUState *cpu, vaddr pc,
         assert(id < MTCC_NR);
         if (hint &&
 #ifdef CONFIG_LATX_TU
-            !tb_is_hras_private(hint) &&
+            !tb_is_lookup_private(hint) &&
 #endif
             get_mask_from_miscflags(hint, MF_MTCC_ID_MASK, MF_MTCC_ID_SHIFT) == id &&
             tb_lookup_cmp(hint, &desc)) {
@@ -387,7 +387,7 @@ static TranslationBlock *tb_htable_lookup_with_hint(CPUState *cpu, vaddr pc,
     } else {
         if (hint &&
 #ifdef CONFIG_LATX_TU
-            !tb_is_hras_private(hint) &&
+            !tb_is_lookup_private(hint) &&
 #endif
             tb_lookup_cmp(hint, &desc)) {
             tb = hint;
@@ -906,7 +906,7 @@ static const void *latx_helper_lookup_tb_hashtable_impl(void *_env,
 #endif
         if (pc_match &&
             cached->cs_base == cs_base && cached->flags == flags &&
-            tb_cflags(cached) == cflags && !tb_is_hras_private(cached) &&
+            tb_cflags(cached) == cflags && !tb_is_lookup_private(cached) &&
             (!aot_tu_enabled() || (flags & HF_CPL_MASK) != HF_CPL_MASK ||
              (cached->bool_flags & IS_AOT_TB))) {
             hint = cached;
