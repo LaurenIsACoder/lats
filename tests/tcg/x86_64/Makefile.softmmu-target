@@ -33,5 +33,18 @@ EXTRA_RUNS+=$(MULTIARCH_RUNS)
 
 memory: CFLAGS+=-DCHECK_UNALIGNED=1
 
+TESTS += scalar-double-store-lanes
+scalar-double-store-lanes: $(X64_SYSTEM_SRC)/scalar-double-store-lanes.c shbr-user.o \
+                           $(LINK_SCRIPT) $(CRT_OBJS) $(MINILIB_OBJS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -O2 $< -o $@ shbr-user.o $(LDFLAGS) -Wl,--wrap=main
+
 # Running
 QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel
+
+run-scalar-double-store-lanes: export LATS_OPT = select,aotsys=0,tumode=jit,shbr=2
+run-scalar-double-store-lanes: scalar-double-store-lanes
+	$(call run-test, $<, $(QEMU) -L $(SRC_PATH)/pc-bios -no-reboot \
+		-monitor none -display none -chardev file$(COMMA)path=$<.out$(COMMA)id=output \
+		$(QEMU_OPTS) $<)
+	$(call quiet-command, grep -Fxq 'SCALAR_LANES total=24 failures=0' $<.out, \
+		CHECK, $< numerical result)

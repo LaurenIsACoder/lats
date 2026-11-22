@@ -2473,6 +2473,9 @@ static bool latxs_tr_ir2_generate_in_tu(TranslationBlock *tb)
 #endif
 
         latxs_tr_init_translate_ir1(tb, i);
+        if (pir1->shbr_restore_zero64_before) {
+            latxs_tr_shbr_restore_zero64(pir1->shbr_restore_zero64_before);
+        }
 
         if ((td->max_insns == i + 1) && (td->sys.cflags & CF_LAST_IO)) {
             latxs_tr_gen_io_start();
@@ -2517,6 +2520,9 @@ static bool latxs_tr_ir2_generate_in_tu(TranslationBlock *tb)
         td->pc_next += latxs_ir1_inst_size(pir1);
         bool clear_esp = latx_adjust_sp_before_translate(tb, pir1, i);
         bool translation_success = ir1_translate(pir1);
+        if (pir1->shbr_restore_zero64_after) {
+            latxs_tr_shbr_restore_zero64(pir1->shbr_restore_zero64_after);
+        }
         if (option_pushpop &&
             (td->sys.flags & HF_CPL_MASK) &&
             clear_esp) {
