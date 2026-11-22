@@ -2061,8 +2061,11 @@ retry:
 int tb_trans_cnt[8];
 #endif
 
-static void register_tu(CPUState *cpu, uint32_t count, TranslationBlock **tb_list)
+static TranslationBlock *register_tu(CPUState *cpu, TranslationBlock *entry,
+                                     uint32_t count, TranslationBlock **tb_list)
 {
+    TranslationBlock *published_entry = entry;
+
     /* A reader can enter any published member and reach the whole unit. */
     for (uint32_t i = 0; i < count; i++) {
         TranslationBlock *tb = tb_list[i];
@@ -2077,7 +2080,14 @@ static void register_tu(CPUState *cpu, uint32_t count, TranslationBlock **tb_lis
 
     for (uint32_t i = 0; i < count; i++) {
         TranslationBlock *tb = tb_list[i];
-        tb_link_page(tb);
+        TranslationBlock *published = tb_link_page(tb, count > 1 && option_tu_hras);
+
+        if (count == 1 && unlikely(published != tb)) {
+            /* No sibling can enter this code. Retire the unpublished copy. */
+            latxs_ras_unlink(tb);
+            tcg_tb_remove(tb);
+            published_entry = published;
+        }
 #ifdef CONFIG_LATX_PRINT
         if (tb->flags & HF_CPL_MASK) {
             tb_trans_cnt[cpu->cpu_index + 4]++;
@@ -2086,6 +2096,7 @@ static void register_tu(CPUState *cpu, uint32_t count, TranslationBlock **tb_lis
         }
 #endif
     }
+    return published_entry;
 }
 
 static int tu_mapped_pages_num(void)
@@ -2361,35 +2372,10 @@ re_translate:
         goto re_translate;
     }
     if (explore_result == TU_EXPLORE_EXISTED) {
-        assert(entry != NULL);
-        /*
-         * The post-lock hash lookup only checks the member TB's pages.
-         * Validate the complete TU before returning executable code.
-         */
-        if (tu_pages_valid(cpu, entry)) {
-            return entry;
-        }
-#ifdef CONFIG_SOFTMMU
-        flags |= HF_FORCE_TB_MODE;
-        cpu->env_ptr->hflags |= HF_FORCE_TB_MODE;
-#endif
-        explore_result = TU_EXPLORE_FALLBACK;
+        goto validate_existing;
     }
     if (explore_result == TU_EXPLORE_FALLBACK || unlikely(entry == NULL)) {
-fallback_to_tb:
-        tb_unlock_ctx_pages(1);
-        tu_reset_explore_state();
-        lsenv->tr_data->is_tu_mode = 0;
-        entry = tb_gen_code(cpu, pc, cs_base, flags, cflags);
-        /*
-         * The ordinary-TB path may already have resolved and published a
-         * usable RAS return target.  Preserve that link; only permanently
-         * disable a site that still has no valid target.
-         */
-        if (!check_misc_flags(entry, MF_RAS_LINKED)) {
-            latxs_ras_unlink(entry);
-        }
-        return entry;
+        goto fallback_to_tb;
     }
     TranslationBlock** tb_list = tu_data->tb_list;
     uint32_t *tb_num_in_tu = &tu_data->tb_num;
@@ -2429,12 +2415,39 @@ fallback_to_tb:
     if (option_tu_hras) {
         tu_build_hras_members(tb_list, *tb_num_in_tu);
     }
-    register_tu(cpu, *tb_num_in_tu, tb_list);
+    TranslationBlock *published = register_tu(cpu, entry, *tb_num_in_tu,
+                                              tb_list);
     latxs_ghbr_stats_commit();
-
     tb_unlock_ctx_pages(1);
     assert_no_pages_locked();
 
+    if (likely(published == entry)) {
+        return entry;
+    }
+    entry = published;
+validate_existing:
+    /* The QHT identity covers this member. Its owner may depend on other
+     * guest pages with different mappings on the current vCPU. */
+    if (tu_pages_valid(cpu, entry)) {
+        return entry;
+    }
+#ifdef CONFIG_SOFTMMU
+    flags |= HF_FORCE_TB_MODE;
+    cpu->env_ptr->hflags |= HF_FORCE_TB_MODE;
+#endif
+fallback_to_tb:
+    tb_unlock_ctx_pages(1);
+    tu_reset_explore_state();
+    lsenv->tr_data->is_tu_mode = 0;
+    entry = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+    /*
+     * The ordinary-TB path may already have resolved and published a
+     * usable RAS return target.  Preserve that link; only permanently
+     * disable a site that still has no valid target.
+     */
+    if (!check_misc_flags(entry, MF_RAS_LINKED)) {
+        latxs_ras_unlink(entry);
+    }
     return entry;
 }
 

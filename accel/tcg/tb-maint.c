@@ -1517,7 +1517,7 @@ void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr)
  * for the same block of guest code that @tb corresponds to. In that case,
  * the caller should discard the original @tb, and use instead the returned TB.
  */
-TranslationBlock *tb_link_page(TranslationBlock *tb)
+TranslationBlock *tb_link_page(TranslationBlock *tb, bool keep_private)
 {
     void *existing_tb = NULL;
     uint32_t h;
@@ -1552,8 +1552,8 @@ re_insert:
             fprintf(stderr, "existing_tb is CF_INVALID\n");
             goto re_insert;
         }
-        if (option_tu_hras && tb_is_tu(tb) &&
-            !(tb->bool_flags & IS_AOT_TB)) {
+        if (keep_private) {
+            g_assert(tb_is_tu(tb));
             /* Keep the canonical lookup target and this TU's local code.
              * tb_record above must remain live for SMC and page unmapping. */
             tb->s_data->tu_tb_mode = TU_TB_MODE_HRAS_PRIVATE;
