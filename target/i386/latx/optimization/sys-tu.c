@@ -2061,46 +2061,31 @@ retry:
 int tb_trans_cnt[8];
 #endif
 
-static void register_tu(uint32 tb_num_in_tu, TranslationBlock **tb_list,
-		CPUState *cpu, int cflags)
+static void register_tu(CPUState *cpu, uint32_t count, TranslationBlock **tb_list)
 {
-    TranslationBlock *etb = NULL;
-    for (int i = 0; i < tb_num_in_tu; i++) {
+    /* A reader can enter any published member and reach the whole unit. */
+    for (uint32_t i = 0; i < count; i++) {
         TranslationBlock *tb = tb_list[i];
-        if (tb->s_data->tu_tb_mode != TU_TB_MODE_BROKEN
-				&& tb->s_data->tu_tb_mode != BAD_TB) {
-            //CPUArchState *env = cpu->env_ptr;
-            //tb_page_addr_t phys_pc;
-            //tb_page_addr_t phys_page2;
-            //target_ulong virt_page2;
-            //phys_pc = get_page_addr_code(env, tb->pc);
-            //if (phys_pc == -1) {
-            //    /* Generate a one-shot TB with 1 insn in it */
-            //    cflags = (cflags & ~CF_COUNT_MASK) | CF_LAST_IO | 1;
-            //}
-            ///* should inset TB to Qht */
-            //virt_page2 = (tb->pc + tb->size - 1) & TARGET_PAGE_MASK;
-            //phys_page2 = -1;
-            //if ((tb->pc & TARGET_PAGE_MASK) != virt_page2) {
-            //    phys_page2 = get_page_addr_code(env, virt_page2);
-            //}
-            tcg_tb_insert(tb);
-#ifdef CONFIG_LATX_PRINT
-            if (tb->flags & HF_CPL_MASK) {
-                tb_trans_cnt[cpu->cpu_index + 4]++;
-            } else {
-                tb_trans_cnt[cpu->cpu_index]++;
-            }
-#endif
-            if (i == tb_num_in_tu -1) {
-                etb = tb_link_page(tb);
-                assert_no_pages_locked();
-            } else {
-                etb = tb_link_page(tb);
-            }
-        }
+
+        /* tb_create rejects these before adding the member to the unit. */
+        tcg_debug_assert(tb->s_data->tu_tb_mode != TU_TB_MODE_BROKEN &&
+                         tb->s_data->tu_tb_mode != BAD_TB);
+        tb->s_data->next_tb[0] = i ? tb_list[i - 1] : NULL;
+        tb->s_data->next_tb[1] = i + 1 < count ? tb_list[i + 1] : NULL;
+        tcg_tb_insert(tb);
     }
-    (void)etb;
+
+    for (uint32_t i = 0; i < count; i++) {
+        TranslationBlock *tb = tb_list[i];
+        tb_link_page(tb);
+#ifdef CONFIG_LATX_PRINT
+        if (tb->flags & HF_CPL_MASK) {
+            tb_trans_cnt[cpu->cpu_index + 4]++;
+        } else {
+            tb_trans_cnt[cpu->cpu_index]++;
+        }
+#endif
+    }
 }
 
 static int tu_mapped_pages_num(void)
@@ -2444,23 +2429,11 @@ fallback_to_tb:
     if (option_tu_hras) {
         tu_build_hras_members(tb_list, *tb_num_in_tu);
     }
-    register_tu(*tb_num_in_tu, tb_list, cpu, cflags);
+    register_tu(cpu, *tb_num_in_tu, tb_list);
     latxs_ghbr_stats_commit();
 
-    /* use for do_tb_phys_invalidate */
-    tb_list[0]->s_data->next_tb[0] = NULL;
-    if (*tb_num_in_tu == 1) {
-        tb_list[0]->s_data->next_tb[1] = NULL;
-    } else {
-        tb_list[0]->s_data->next_tb[1] = tb_list[1];
-        tb_list[*tb_num_in_tu - 1]->s_data->next_tb[0] = tb_list[*tb_num_in_tu - 2];
-        tb_list[*tb_num_in_tu - 1]->s_data->next_tb[1] = NULL;
-        for (int i = 1; i < *tb_num_in_tu - 1; ++i) {
-            tb_list[i]->s_data->next_tb[0] = tb_list[i - 1];
-            tb_list[i]->s_data->next_tb[1] = tb_list[i + 1];
-        }
-    }
     tb_unlock_ctx_pages(1);
+    assert_no_pages_locked();
 
     return entry;
 }
