@@ -232,7 +232,7 @@ static struct { int htable[MTCC_NR]; } tb_ctx;
 static tb_page_addr_t get_page_addr_code(void *env, vaddr pc) { (void)env; (void)pc; return stub_phys_pc; }
 static bool qemu_tcg_mtcc_enabled(void) { return true; }
 static uint32_t curr_mtcc(void *env) { (void)env; return 0; }
-static bool tb_is_hras_private(const TranslationBlock *tb) { return (tb->bool_flags & IS_HRAS_CALL) != 0; }
+static bool tb_is_lookup_private(const TranslationBlock *tb) { return (tb->bool_flags & IS_HRAS_CALL) != 0; }
 static bool tb_lookup_cmp(const void *p, const void *d) {
     const TranslationBlock *tb = p;
     const struct tb_desc *desc = d;

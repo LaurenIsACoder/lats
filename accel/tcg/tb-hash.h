@@ -224,7 +224,7 @@ static inline void tb_jmp_cache_insert(CPUState *cpu, vaddr pc,
         return;
     }
 #ifdef CONFIG_LATX_TU
-    if (tb_is_hras_private(tb)) {
+    if (tb_is_lookup_private(tb)) {
         return;
     }
 #endif
@@ -248,7 +248,7 @@ static inline void tb_jmp_cache_insert(CPUState *cpu, vaddr pc,
     /* A publisher can retire this key after our first check. Pair with its
      * barrier before cache invalidation so neither side misses the store. */
     smp_mb();
-    if (tb_is_hras_private(tb)) {
+    if (tb_is_lookup_private(tb)) {
         qatomic_cmpxchg(&entry->tb, tb, NULL);
         latx_njc_invalidate(cpu, hash, pc, tb);
     }

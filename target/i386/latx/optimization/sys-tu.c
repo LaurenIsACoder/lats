@@ -2080,13 +2080,18 @@ static TranslationBlock *register_tu(CPUState *cpu, TranslationBlock *entry,
 
     for (uint32_t i = 0; i < count; i++) {
         TranslationBlock *tb = tb_list[i];
-        TranslationBlock *published = tb_link_page(tb, count > 1 && option_tu_hras);
+        TranslationBlock *published = tb_link_page(tb, count > 1);
 
-        if (count == 1 && unlikely(published != tb)) {
-            /* No sibling can enter this code. Retire the unpublished copy. */
-            latxs_ras_unlink(tb);
-            tcg_tb_remove(tb);
-            published_entry = published;
+        if (unlikely(published != tb)) {
+            if (tb == entry) {
+                published_entry = published;
+            }
+            if (count == 1) {
+                /* No sibling can enter this code. Drop the outgoing RAS edge
+                 * and host-PC record before returning the canonical entry. */
+                latxs_ras_unlink(tb);
+                tcg_tb_remove(tb);
+            }
         }
 #ifdef CONFIG_LATX_PRINT
         if (tb->flags & HF_CPL_MASK) {
