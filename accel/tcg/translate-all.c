@@ -1014,6 +1014,15 @@ relock:
         break;
     case GENCODE_ERR_TB_EXIST: /* existing tb */
         tb_unlock_ctx_pages(1);
+#if defined(CONFIG_SOFTMMU) && defined(CONFIG_LATX_TU)
+        /* A competing TU can own additional pages outside this TB's key. */
+        if (tb_is_tu(tb) && !tu_pages_valid(cpu, tb)) {
+            flags |= HF_FORCE_TB_MODE;
+            env->hflags |= HF_FORCE_TB_MODE;
+            lookup_after_lock = true;
+            goto relock;
+        }
+#endif
         return tb;
     case GENCODE_ERR_BUF_OVERFLOW: /* buffer overflow */
         /* set code_gen_ptr to force alloc a new region */
