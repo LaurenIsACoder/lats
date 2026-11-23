@@ -290,7 +290,10 @@ static void tlb_flush_one_mmuidx_locked(CPUArchState *env, int mmu_idx,
 
 #ifndef CONFIG_LATX_RR
     /* A newly allocated table still needs its invalid-entry sentinels. */
-    dirty |= tlb_mmu_resize_locked(desc, fast, now);
+    if (tlb_mmu_resize_locked(desc, fast, now)) {
+        env_tlb(env)->c.fast_changed = true;
+        dirty = true;
+    }
 #endif
     if (dirty) {
         tlb_mmu_flush_locked(env, desc, fast);
@@ -310,6 +313,7 @@ static void tlb_mmu_init(CPUArchState *env, int index,
     desc->n_used_entries = 0;
     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_new(CPUTLBEntry, n_entries);
+    env_tlb(env)->c.fast_changed = true;
     fast->itlb = cpu_fast_itlb_base(env_cpu(env), index);
     desc->fulltlb = g_new(CPUTLBEntryFull, n_entries);
     tlb_mmu_flush_locked(env, desc, fast);
@@ -420,7 +424,10 @@ static void pcid_save_tlb(CPUState *cpu, LatxPcidBank *bank)
     CPUTLB *tlb = env_tlb(env);
 
     memcpy(bank->d, tlb->d, sizeof(bank->d));
-    memcpy(bank->f, tlb->f, sizeof(bank->f));
+    if (tlb->c.fast_changed) {
+        memcpy(bank->f, tlb->f, sizeof(bank->f));
+        tlb->c.fast_changed = false;
+    }
     bank->dirty = tlb->c.dirty;
     bank->large_page_bits = env->hamt_large_page_bits;
 }
