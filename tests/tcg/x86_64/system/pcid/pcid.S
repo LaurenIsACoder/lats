@@ -289,6 +289,9 @@
     shlq $32,%rdx
     orq %rdx,%rax
     movq %rax,0x21100
+#ifdef PCID_INVLPG
+    call .Linvlpg_global
+#else
 #ifdef PCID_INVPCID_TYPE
     /* Initial code-page protection can evict hardware ASIDs. Allow warmup
      * before requiring 4096 retained switches back to A. */
@@ -358,6 +361,7 @@
     jne .Lfail
     decl %ecx
     jnz .Lswitch_pair
+#endif
     lfence
     rdtsc
     shlq $32,%rdx
@@ -367,7 +371,7 @@
 #endif
 #if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
     call .Linvpcid_cross_page
-    call .Linvpcid_split_large
+    call .Lsplit_large
 #endif
 #ifdef PCID_CACHE_SMC
     /* Modify A through the identity alias while B owns the CPU. */
@@ -750,6 +754,15 @@
     movl $PML4_A,%edi
     movq %rdi,%cr3
     check_non_pcide_page 0x11
+#ifdef PCID_INVLPG
+    /* A rotated ASID is active, but it has no PCID slot in pcid_valid. */
+    movq $NON_PCIDE_PAGE_B+3,PT_A
+    invlpg (%rsi)
+    check_non_pcide_page 0x22
+    movq $NON_PCIDE_PAGE_A+3,PT_A
+    invlpg (%rsi)
+    check_non_pcide_page 0x11
+#endif
     movl $NON_PCIDE_ITERATIONS,%ecx
     lfence
     rdtsc
@@ -856,13 +869,20 @@
     movq %rax,%cr3
     ret
 
+#endif
+#if defined(PCID_INVLPG) || \
+    (defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0)
 /* Split a cached 2M leaf in B. Invalidate a different 4K subpage and
  * check the old instruction and data aliases, first in active B, then in
  * inactive B. Walking the new page tables alone would miss the old 2M leaf. */
-.Linvpcid_split_large:
+.Lsplit_large:
     xorl %ebp,%ebp
 1:
+#ifdef PCID_INVLPG
+    movq $0x183,0x6010
+#else
     movq $0x83,0x6010
+#endif
     movl $CR3_B,%eax
     movq %rax,%cr3
     movl $(ALIAS+CODE_A),%edi
@@ -878,10 +898,14 @@
 2:
     movq $CODE_B+3,PT_B+8*(CODE_A>>12)
     movq $PT_B+3,0x6010
+#ifdef PCID_INVLPG
+    invlpg (ALIAS+0x2000)
+#else
     movq $2,DESC
     movq $ALIAS+0x2000,DESC+8
     xorl %eax,%eax
     invpcid DESC,%rax
+#endif
     testl %ebp,%ebp
     jz 3f
     movabsq $(NOFLUSH | CR3_B),%rax
@@ -898,6 +922,66 @@
     movq $0,PT_B+8*(CODE_A>>12)
     movabsq $(NOFLUSH | CR3_A),%rax
     movq %rax,%cr3
+    ret
+#endif
+#ifdef PCID_INVLPG
+.Linvlpg_global:
+    /* Both PCIDs cache the same global mapping. Only B uses the probe VA. */
+    movq %cr4,%r11
+    movq %r11,%rax
+    orl $0x80,%eax
+    movq %rax,%cr4
+    movq $CODE_A+0x103,PT_A
+    movq $CODE_A+0x103,PT_B
+    movq $0x120003,PROBE_PTE
+    movl $CR3_B,%eax
+    movq %rax,%cr3
+    movl PROBE_VA,%eax
+    movl $ALIAS,%esi
+    call *%rsi
+    movl $CODE_B+0x103,%r8d
+    movl $CODE_A+0x103,%r9d
+    movl $0x22,%r10d
+    movl $0,0x2110c
+    movl $4112,%ecx
+1:
+    andq $~0x20,PROBE_PTE
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    call *%rsi
+    movq %r8,PT_A
+    movq %r8,PT_B
+    invlpg 64(%rsi)
+    cmpb %r10b,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl %r10d,%eax
+    jne .Lfail
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    cmpb %r10b,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl %r10d,%eax
+    jne .Lfail
+    movl PROBE_VA,%eax
+    testb $0x20,PROBE_PTE
+    jnz 2f
+    incl 0x2110c
+2:
+    xchgq %r8,%r9
+    xorl $0x33,%r10d
+    decl %ecx
+    jnz 1b
+    movq $CODE_A+3,PT_A
+    movq $CODE_B+3,PT_B
+    movq $0,PROBE_PTE
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    invlpg (%rsi)
+    call .Lsplit_large
+    movq %r11,%cr4
+    orl $8,0x21108
     ret
 #endif
 .Luser_test:

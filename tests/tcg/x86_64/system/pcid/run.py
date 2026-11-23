@@ -124,7 +124,7 @@ def run(binary, rom, mode, engine, timeout, cache=False, reset=False,
                                         int(words[5], 16) << 32)
                         if not legacy_ticks or int(words[6], 16) != 1024:
                             raise RuntimeError('incomplete non-PCIDE CR3 loop')
-                    probe_hits = int(words[3], 16) if page_test else None
+                    probe_hits = int(words[3], 16) if flags & (2 | 8) else None
                     reset_stats = None
                     if reset:
                         request(stream, 'system_reset')
@@ -152,6 +152,16 @@ def run(binary, rom, mode, engine, timeout, cache=False, reset=False,
                 raise RuntimeError('PCIDE was not enabled on both CPUs')
             if mode != 'A' and engine == 'lat' and not stats[0]['hw_refills']:
                 raise RuntimeError('guest did not exercise HAMT hardware refill')
+            if mode == 'C' and flags & 8:
+                bsp = stats[0]
+                if probe_hits * 10 < 4112 * 9:
+                    raise RuntimeError(
+                        f'INVLPG probe hits: {probe_hits}/4112')
+                if (bsp['retained'] < 8192 or
+                        (cache and bsp['cache_retained'] < 8192)):
+                    raise RuntimeError('INVLPG discarded a PCID context')
+                if bsp['invlpg_page'] < 4112 or not bsp['invlpg_large']:
+                    raise RuntimeError('missing INVLPG invalidation path')
             if mode == 'C' and stats[0]['retained'] < 4096:
                 raise RuntimeError('ASID retention not exercised')
             if cache and stats[0]['cache_retained'] < 4096:

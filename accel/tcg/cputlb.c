@@ -488,7 +488,9 @@ static void pcid_flush_active_bank_locked(CPUState *cpu, int64_t now)
     pcid_clear_active_tables_locked(cpu, now);
     /* Reset history only when both software and hardware are invalidated. */
     env->hamt_large_page_bits = 0;
-    cache->bank[cache->active].epoch = cache->epoch;
+    if (cache) {
+        cache->bank[cache->active].epoch = cache->epoch;
+    }
 }
 
 bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain)
@@ -1008,6 +1010,66 @@ static void pcid_flush_bank_page(CPUState *cpu, LatxPcidBank *bank, vaddr page)
         tb_jmp_cache_flush_page_bank(cpu, jc, njc, page - TARGET_PAGE_SIZE);
         tb_jmp_cache_flush_page_bank(cpu, jc, njc, page);
     }
+}
+
+/*
+ * HAMT keeps guest global translations under the ASID that filled them.
+ * INVLPG must reach the address in every reusable context on this vCPU.
+ */
+void tlb_flush_x86_invlpg(CPUState *cpu, vaddr addr)
+{
+    CPUArchState *env = cpu->env_ptr;
+    struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
+    vaddr page = addr & TARGET_PAGE_MASK;
+    uint32_t bit = hamt_large_page_bit(page);
+    bool large;
+
+    if (!option_pcid_asid || !hamt_is_running() ||
+        (env->hflags & HF_GUEST_MASK)) {
+        tlb_flush_page(cpu, page);
+        return;
+    }
+
+    assert_cpu_is_self(cpu);
+    qemu_spin_lock(&env_tlb(env)->c.lock);
+    large = env->hamt_large_page_bits & bit;
+
+    if (cache && (env->cr[4] & CR4_PCIDE_MASK)) {
+        for (unsigned i = 1; i < ARRAY_SIZE(cache->bank); i++) {
+            LatxPcidBank *bank = &cache->bank[i];
+
+            if (i == cache->active || !bank->initialized ||
+                bank->epoch != cache->epoch) {
+                continue;
+            }
+            if (bank->large_page_bits & bit) {
+                /* Selection clears this bank and ASID before reuse. */
+                bank->epoch = 0;
+                env->pcid_valid &= ~(1U << (i - 1));
+            } else {
+                pcid_flush_bank_page(cpu, bank, page);
+            }
+        }
+    }
+    if (large && !cache) {
+        /* Without banks the large-page history is shared by all ASIDs. */
+        hamt_flush_tlb_all();
+    } else {
+        hamt_flush_tlb_pcid_page(env, page, large);
+    }
+    if (large) {
+        pcid_flush_active_bank_locked(cpu, get_clock_realtime());
+        if (option_pcid_stats) {
+            qatomic_inc(&env_archcpu(env)->pcid_profile.invlpg_large);
+        }
+    } else {
+        pcid_flush_bank_page(cpu, NULL, page);
+        if (option_pcid_stats) {
+            qatomic_inc(&env_archcpu(env)->pcid_profile.invlpg_page);
+        }
+    }
+    qemu_spin_unlock(&env_tlb(env)->c.lock);
+    pcid_flush_shared_code_caches(cpu);
 }
 
 /* INVPCID supplies a 12-bit PCID, independent of the current CR3 root. */

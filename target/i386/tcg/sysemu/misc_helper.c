@@ -638,7 +638,7 @@ void helper_rdmsr(CPUX86State *env)
 
 void helper_flush_page(CPUX86State *env, target_ulong addr)
 {
-    tlb_flush_page(env_cpu(env), addr);
+    tlb_flush_x86_invlpg(env_cpu(env), addr);
 }
 
 static G_NORETURN

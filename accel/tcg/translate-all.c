@@ -2405,6 +2405,10 @@ void dump_exec_info(GString *buf, int tbbytime)
                                    qatomic_read(&profile->invpcid_page),
                                    qatomic_read(
                                        &profile->invpcid_large));
+            g_string_append_printf(buf, " invlpg_page=%" PRIu64
+                                   " invlpg_large=%" PRIu64,
+                                   qatomic_read(&profile->invlpg_page),
+                                   qatomic_read(&profile->invlpg_large));
             g_string_append_printf(buf, " asid_rotations=%" PRIu64
                                    " asid_batches=%" PRIu64,
                                    qatomic_read(&profile->asid_rotations),

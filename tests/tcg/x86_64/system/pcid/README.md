@@ -113,6 +113,15 @@ For a burst of type 0 requests targeting an inactive bank, also define
 requires invalidating the entire jump table. The bank must clear it before
 executing the remapped code when selected again.
 
+To exercise guest INVLPG, build the SMP/BENCH/WAIT ROM with `-DPCID_INVLPG`
+and run mode C with and without `--cache`. Two PCIDs execute and read a
+global page that changes backing after each INVLPG. The inactive PCID's
+unrelated 4K page is probed via its Accessed bit. The ROM also splits a
+cached 2M leaf in the active and inactive contexts. With PCID statistics
+enabled, `invlpg_page` counts requests handled by page in the active
+context and `invlpg_large` counts requests widened there. Inactive banks
+use their own large-page history.
+
 Add `-DPCID_LEGACY` at assembly time to run 32-bit protected-mode checks
 before entering long mode. These include a non-flat FS descriptor, a
 16-byte operand crossing its segment limit, a null selector, and attempts

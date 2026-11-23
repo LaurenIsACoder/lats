@@ -25,13 +25,15 @@ clear. An inactive bank defers that clear until selection, coalescing
 requests while its cached code cannot run.
 Type 1 always invalidates the target context. Whole inactive contexts are
 marked stale before reuse. A different PCID in the same slot remains valid.
-Explicit full/page/range mapping invalidations expire inactive banks lazily. On an INVLPG that covers a cached large page, all active jump
-buckets are cleared, including destinations elsewhere in the same mapping.
-Untagged HAMT walkers record the virtual regions of large-page fills in a
-per-vCPU bitmap. An INVLPG outside those regions can keep unrelated hardware
-translations. Collisions and 1 GiB pages conservatively widen the flush.
-INVLPG invalidates all tagged hardware ASIDs. Physical
-dirty-tracking notifications update matching writable TLB entries in every
+Generic mapping invalidations expire inactive banks lazily. With tagged
+HAMT enabled, a guest INVLPG invalidates the address under the active
+ASID and each reusable ASID: guest global pages can be cached under
+several tags. It clears that page in each live software bank. A possible
+large mapping in an inactive bank expires that context before reuse. A
+hit in the active bank clears its ASID and software tables. In ASID-only
+mode the large-page bitmap is shared, so a hit requires a full local flush. Without tagged HAMT, the existing large-page bitmap
+also allows unrelated hardware translations to survive an ordinary INVLPG.
+Physical dirty-tracking notifications update matching writable TLB entries in every
 live bank under the TLB lock, preserving unrelated mappings and jump caches.
 The dirty scan holds the CPU-list lock across traversal so unplug waits for
 readers before freeing the active and saved tables.

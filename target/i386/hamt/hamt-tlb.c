@@ -135,6 +135,27 @@ void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr)
                          "r"(addr) : "memory");
 }
 
+void hamt_flush_tlb_pcid_page(CPUX86State *env, uint64_t page, bool large)
+{
+    unsigned active = env->hamt_guest_asid;
+
+    /* The active ASID may have refilled after pcid_valid was cleared. */
+    if (large) {
+        hamt_flush_tlb_asid(active);
+        latx_mem_clear_hpet_vpages();
+    } else {
+        hamt_flush_tlb_asid_page(active, page);
+        latx_mem_clear_hpet_vpage(page);
+    }
+    for (unsigned mask = env->pcid_valid; mask; mask &= mask - 1) {
+        unsigned asid = X86_HAMT_ASID_BASE + ctz32(mask);
+
+        if (asid != active) {
+            hamt_flush_tlb_asid_page(asid, page);
+        }
+    }
+}
+
 /*
  * Non-PCIDE MOV CR3 invalidates even on a same-root reload. Each vCPU owns
  * a separate range above the PCID slots. Never reuse a tag in this range
