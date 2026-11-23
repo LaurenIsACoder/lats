@@ -727,8 +727,14 @@ void tlb_flush_counts(size_t *pfull, size_t *ppart, size_t *pelide)
     *pelide = elide;
 }
 
+enum TlbFlushReason {
+    TLB_FLUSH_MAPPING,
+    TLB_FLUSH_PCID_SWITCH,
+    TLB_FLUSH_ROTATED_ASID,
+};
+
 static void tlb_flush_by_mmuidx_work(CPUState *cpu, uint16_t asked,
-                                     bool flush_hamt)
+                                     enum TlbFlushReason reason)
 {
     /* Explicit mapping invalidation expires inactive software banks too. */
     if (option_rastoptp) latxs_flush_soft_ras(cpu);
@@ -741,17 +747,20 @@ static void tlb_flush_by_mmuidx_work(CPUState *cpu, uint16_t asked,
     tlb_debug("mmu_idx:0x%04" PRIx16 "\n", asked);
 
     qemu_spin_lock(&env_tlb(env)->c.lock);
-    if (flush_hamt) {
+    if (reason != TLB_FLUSH_PCID_SWITCH) {
         pcid_cache_expire_locked(cpu);
     }
 
-    if (flush_hamt && hamt_enabled() && hamt_is_running()) {
+    if (reason == TLB_FLUSH_MAPPING && hamt_enabled() && hamt_is_running()) {
         hamt_flush_tlb_all();
         if (asked == ALL_MMUIDX_BITS) {
             env->hamt_large_page_bits = 0;
         }
     }
 
+    if (reason == TLB_FLUSH_ROTATED_ASID) {
+        env->hamt_large_page_bits = 0;
+    }
     all_dirty = env_tlb(env)->c.dirty;
     to_clean = asked & all_dirty;
     all_dirty &= ~to_clean;
@@ -766,7 +775,8 @@ static void tlb_flush_by_mmuidx_work(CPUState *cpu, uint16_t asked,
      * The HAMT refill handler can populate the fast instruction caches
      * without touching the generic software TLB's dirty bits.
      */
-    if (option_pcid && (env->cr[4] & CR4_PCIDE_MASK)) {
+    if (reason == TLB_FLUSH_ROTATED_ASID ||
+        (option_pcid && (env->cr[4] & CR4_PCIDE_MASK))) {
         if ((asked & ~to_clean) & (1U << MMU_KNOSMAP_IDX)) {
             cpu_fast_itlb_flush(cpu, MMU_KNOSMAP_IDX);
         }
@@ -797,7 +807,12 @@ static void tlb_flush_by_mmuidx_work(CPUState *cpu, uint16_t asked,
 
 static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 {
-    tlb_flush_by_mmuidx_work(cpu, data.host_int, true);
+    tlb_flush_by_mmuidx_work(cpu, data.host_int, TLB_FLUSH_MAPPING);
+}
+
+void tlb_flush_after_asid_rotation(CPUState *cpu)
+{
+    tlb_flush_by_mmuidx_work(cpu, ALL_MMUIDX_BITS, TLB_FLUSH_ROTATED_ASID);
 }
 
 static void pcid_flush_shared_code_caches(CPUState *cpu)
@@ -816,7 +831,7 @@ void tlb_flush_unbanked_pcid_caches(CPUState *cpu)
     if (cpu->latx_pcid_caches) {
         pcid_flush_shared_code_caches(cpu);
     } else {
-        tlb_flush_by_mmuidx_work(cpu, ALL_MMUIDX_BITS, false);
+        tlb_flush_by_mmuidx_work(cpu, ALL_MMUIDX_BITS, TLB_FLUSH_PCID_SWITCH);
     }
 }
 

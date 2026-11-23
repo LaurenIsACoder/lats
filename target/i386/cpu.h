@@ -2048,6 +2048,7 @@ struct kvm_msrs;
 /* Keep host diagnostics outside the env layout used by saved code. */
 typedef struct X86PcidProfile {
     uint64_t invpcid_page, invpcid_large;
+    uint64_t asid_rotations, asid_batches;
 } X86PcidProfile;
 #endif
 

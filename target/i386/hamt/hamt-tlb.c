@@ -135,6 +135,46 @@ void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr)
                          "r"(addr) : "memory");
 }
 
+/*
+ * Non-PCIDE MOV CR3 invalidates even on a same-root reload. Each vCPU owns
+ * a separate range above the PCID slots. Never reuse a tag in this range
+ * until the local non-global TLB has been flushed.
+ */
+bool hamt_rotate_cr3_asid(CPUX86State *env)
+{
+    const unsigned count = 32;
+    unsigned cpu_index = env_cpu(env)->cpu_index;
+    unsigned first = X86_HAMT_ASID_BASE + X86_PCID_SLOTS;
+    unsigned current = env->hamt_guest_asid;
+
+    /* The ASID field has at most ten usable bits. */
+    if (cpu_index >= (1024 - first) / count) {
+        return false;
+    }
+    first += cpu_index * count;
+    if (current - first >= count) {
+        unsigned bits = extract32(read_csr_asid(), 16, 8);
+
+        if (first + count > (1U << MIN(bits, 10U))) {
+            return false;
+        }
+    }
+    if (current - first >= count - 1) {
+        hamt_flush_tlb_all();
+        env->hamt_guest_asid = first;
+        if (option_pcid_stats) {
+            qatomic_inc(&env_archcpu(env)->pcid_profile.asid_batches);
+        }
+    } else {
+        env->hamt_guest_asid = current + 1;
+        latx_mem_clear_hpet_vpages();
+    }
+    if (option_pcid_stats) {
+        qatomic_inc(&env_archcpu(env)->pcid_profile.asid_rotations);
+    }
+    return true;
+}
+
 bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
 {
     unsigned slot = cr3 & (X86_PCID_SLOTS - 1);

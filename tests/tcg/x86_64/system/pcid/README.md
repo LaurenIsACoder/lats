@@ -76,6 +76,22 @@ exercise guest hardware refill. Treat the result as mechanism evidence.
 Windows adoption requires observing CR4.PCIDE and no-flush writes in the
 target Windows workload itself.
 
+Add `-DPCID_CR3_NON_PCIDE` to run a separate CR3 regression before the
+ordinary ROM checks. It runs in long mode with CR4.PCIDE clear and writes
+aligned page-table roots without the PCID no-flush hint. Each of 256
+iterations remaps an active 4 KiB page, rewrites the current root, switches
+from A to B and back, and remaps and rewrites A once more. Every write is
+followed by a data read and execution at the same virtual address, with
+distinct expected values for the two physical pages. The 1024 timed writes
+are sufficient for repeated wraparound of a 32-tag rotation. The probe
+then restores the initial mappings and root.
+
+The elapsed guest TSC covers the loop, including mapping updates, data
+reads and calls. Setup and restoration are outside the interval. With
+this build macro, guest result flags at `0x21108` have bit 2 set after the
+probe completes. Read the elapsed TSC as a 64-bit value at `0x21110` and
+the timed CR3 write count as a 32-bit value at `0x21118`.
+
 To check targeted INVPCID, build the SMP/BENCH/WAIT ROM twice, adding
 `-DPCID_INVPCID_TYPE=0` and `-DPCID_INVPCID_TYPE=1` respectively. Run
 each ROM in mode C with `--cache`. Each of the 4112 switch pairs remaps the

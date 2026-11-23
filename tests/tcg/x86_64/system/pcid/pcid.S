@@ -212,6 +212,10 @@
     movl $0x55,%eax
     jmp .Ldone
 #endif
+#ifdef PCID_CR3_NON_PCIDE
+    call .Lcr3_non_pcide
+    orl $4,0x21108
+#endif
     movl $1,%eax
     cpuid
     btl $17,%ecx
@@ -714,6 +718,74 @@
 .Lwrap_gdtr:
     .word 39
     .quad ROM(.Lwrap_gdt)
+#ifdef PCID_CR3_NON_PCIDE
+#define NON_PCIDE_PAGE_A 0x114000
+#define NON_PCIDE_PAGE_B 0x115000
+#define NON_PCIDE_ITERATIONS 256
+.macro check_non_pcide_page expected
+    cmpb $\expected,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl $\expected,%eax
+    jne .Lfail
+.endm
+.Lcr3_non_pcide:
+    movq %cr4,%rax
+    testl $0x20000,%eax
+    jnz .Lfail
+    movq PT_A,%r8
+    movq PT_B,%r9
+    movl $0x000011b8,NON_PCIDE_PAGE_A
+    movw $0xc300,NON_PCIDE_PAGE_A+4
+    movb $0x11,NON_PCIDE_PAGE_A+64
+    movl $0x000022b8,NON_PCIDE_PAGE_B
+    movw $0xc300,NON_PCIDE_PAGE_B+4
+    movb $0x22,NON_PCIDE_PAGE_B+64
+    movq $NON_PCIDE_PAGE_A+3,PT_A
+    movq $NON_PCIDE_PAGE_A+3,PT_B
+    movl $ALIAS,%esi
+    movl $PML4_B,%edi
+    movq %rdi,%cr3
+    check_non_pcide_page 0x11
+    movl $PML4_A,%edi
+    movq %rdi,%cr3
+    check_non_pcide_page 0x11
+    movl $NON_PCIDE_ITERATIONS,%ecx
+    lfence
+    rdtsc
+    shlq $32,%rdx
+    orq %rax,%rdx
+    movq %rdx,%r10
+.Lcr3_non_pcide_loop:
+    /* Warm A still points to the old page until CR3 is rewritten. */
+    movq $NON_PCIDE_PAGE_B+3,PT_A
+    movq %rdi,%cr3
+    check_non_pcide_page 0x22
+
+    movl $PML4_B,%edx
+    movq %rdx,%cr3
+    check_non_pcide_page 0x11
+    movq %rdi,%cr3
+    check_non_pcide_page 0x22
+
+    movq $NON_PCIDE_PAGE_A+3,PT_A
+    movq %rdi,%cr3
+    check_non_pcide_page 0x11
+    decl %ecx
+    jnz .Lcr3_non_pcide_loop
+    lfence
+    rdtsc
+    shlq $32,%rdx
+    orq %rdx,%rax
+    subq %r10,%rax
+    movq %rax,0x21110
+    movl $NON_PCIDE_ITERATIONS*4,0x21118
+
+    movq %r8,PT_A
+    movq %r9,PT_B
+    movq %rdi,%cr3
+    ret
+#endif
 .Llarge_page:
     /* Cache code in one 4K subpage, invalidate a different one of the same PDE. */
     movq $0x200083,0x3008

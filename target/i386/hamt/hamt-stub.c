@@ -61,6 +61,11 @@ pid_t hamt_fake_fork(void *dunekvmcpu, void *fn, void *data)
     return -1;
 }
 
+bool hamt_rotate_cr3_asid(struct CPUArchState *env)
+{
+    return false;
+}
+
 bool hamt_switch_pcid(struct CPUArchState *env, uint64_t cr3, bool noflush)
 {
     return false;

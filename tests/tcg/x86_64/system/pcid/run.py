@@ -111,11 +111,19 @@ def run(binary, rom, mode, engine, timeout, cache=False, reset=False,
                         raise RuntimeError('guest reported incorrect state:\n' +
                                            hmp('info registers -a'))
                     stats = read_stats(hmp('info jit'))
-                    words = hmp('xp /4wx 0x21100').split(':')[1].split()
+                    lines = hmp('xp /7wx 0x21100').splitlines()
+                    words = [w for line in lines
+                             for w in line.partition(':')[2].split()]
                     elapsed = int(words[0], 16) | int(words[1], 16) << 32
                     flags = int(words[2], 16)
                     smc = flags & 1
                     page_test = flags & 2
+                    legacy_ticks = 0
+                    if flags & 4:
+                        legacy_ticks = (int(words[4], 16) |
+                                        int(words[5], 16) << 32)
+                        if not legacy_ticks or int(words[6], 16) != 1024:
+                            raise RuntimeError('incomplete non-PCIDE CR3 loop')
                     probe_hits = int(words[3], 16) if page_test else None
                     reset_stats = None
                     if reset:
@@ -166,6 +174,7 @@ def run(binary, rom, mode, engine, timeout, cache=False, reset=False,
                     'ap_unplugged': bool(cache and smc),
                     'unrelated_page_hits': probe_hits,
                     'switch_pair_tsc_ticks': elapsed,
+                    'legacy_ticks': legacy_ticks,
                     'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
         finally:
             proc.terminate()
