@@ -820,7 +820,9 @@ void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
 
 void tlb_flush(CPUState *cpu)
 {
-    if (hamt_enabled() && hamt_is_running()) {
+    /* The worker flushes HAMT inline for the current vCPU. */
+    if (hamt_enabled() && hamt_is_running() &&
+        (!cpu->created || cpu != current_cpu || !qemu_cpu_is_self(cpu))) {
         hamt_flush_tlb_all();
     }
     tlb_flush_by_mmuidx(cpu, ALL_MMUIDX_BITS);
