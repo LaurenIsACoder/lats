@@ -280,8 +280,7 @@ void helper_invpcid(CPUX86State *env, target_ulong addr, uint32_t reg,
         qatomic_inc(&env->pcid_stats.invpcid[type]);
     }
     if (type <= 1) {
-        /* Type 0 may invalidate other addresses in the same context. */
-        tlb_flush_pcid(env_cpu(env), pcid);
+        tlb_flush_pcid(env_cpu(env), pcid, type == 0 ? &linear : NULL);
     } else {
         tlb_flush(env_cpu(env));
     }

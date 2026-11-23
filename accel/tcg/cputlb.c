@@ -333,6 +333,7 @@ typedef struct LatxPcidBank {
     CPUTLBDesc d[NB_MMU_MODES];
     CPUTLBDescFast f[NB_MMU_MODES];
     uint16_t dirty;
+    uint32_t large_page_bits;
     uint64_t epoch;
     CPUJumpCache *jc;
     LatxNJC *njc;
@@ -408,20 +409,24 @@ void latx_pcid_cache_init(CPUState *cpu)
 
 static void pcid_save_tlb(CPUState *cpu, LatxPcidBank *bank)
 {
-    CPUTLB *tlb = env_tlb(cpu->env_ptr);
+    CPUArchState *env = cpu->env_ptr;
+    CPUTLB *tlb = env_tlb(env);
 
     memcpy(bank->d, tlb->d, sizeof(bank->d));
     memcpy(bank->f, tlb->f, sizeof(bank->f));
     bank->dirty = tlb->c.dirty;
+    bank->large_page_bits = env->hamt_large_page_bits;
 }
 
 static void pcid_load_tlb(CPUState *cpu, LatxPcidBank *bank)
 {
-    CPUTLB *tlb = env_tlb(cpu->env_ptr);
+    CPUArchState *env = cpu->env_ptr;
+    CPUTLB *tlb = env_tlb(env);
 
     memcpy(tlb->d, bank->d, sizeof(bank->d));
     memcpy(tlb->f, bank->f, sizeof(bank->f));
     tlb->c.dirty = bank->dirty;
+    env->hamt_large_page_bits = bank->large_page_bits;
 }
 
 void latx_pcid_cache_reset(CPUState *cpu)
@@ -462,6 +467,8 @@ static void pcid_flush_active_bank_locked(CPUState *cpu, int64_t now)
     cpu_fast_itlb_flush(cpu, MMU_KNOSMAP_IDX);
     cpu_fast_itlb_flush(cpu, MMU_USER_IDX);
     tb_jmp_cache_flush_current(cpu);
+    /* Reset history only when both software and hardware are invalidated. */
+    env->hamt_large_page_bits = 0;
     cache->bank[cache->active].epoch = cache->epoch;
 }
 
@@ -553,45 +560,31 @@ void latx_pcid_jump_flush(CPUState *cpu)
     }
     for (unsigned i = 0; i < ARRAY_SIZE(cache->bank); i++) {
         CPUJumpCache *jc = qatomic_rcu_read(&cache->bank[i].jc);
-        LatxNJC *njc;
 
         /* Only the owner can inspect the active bank and mapping generation. */
         if (!jc || (cpu == current_cpu && i != cache->active &&
                     cache->bank[i].epoch != cache->epoch)) {
             continue;
         }
-        memset(jc->array, 0, latx_jmp_cache_size() * sizeof(jc->array[0]));
-        njc = cache->bank[i].njc;
-        if (njc) {
-            memset(njc->array, 0,
-                   latx_jmp_cache_size() * sizeof(njc->array[0]));
-        }
+        tb_jmp_cache_flush_bank(jc, cache->bank[i].njc);
     }
 }
 
 void latx_pcid_jump_flush_page(CPUState *cpu, vaddr pc)
 {
     struct LatxPcidCaches *cache = qatomic_rcu_read(&cpu->latx_pcid_caches);
-    unsigned first = tb_jmp_cache_hash_page(pc);
-    unsigned nfirst = latx_njc_hash_page(cpu, pc);
 
     if (!cache) {
         return;
     }
     for (unsigned i = 0; i < ARRAY_SIZE(cache->bank); i++) {
         CPUJumpCache *jc = qatomic_rcu_read(&cache->bank[i].jc);
-        LatxNJC *njc;
 
         if (!jc || (i != cache->active &&
                     cache->bank[i].epoch != cache->epoch)) {
             continue;
         }
-        memset(&jc->array[first], 0, TB_JMP_PAGE_SIZE * sizeof(jc->array[0]));
-        njc = cache->bank[i].njc;
-        if (njc) {
-            memset(&njc->array[nfirst], 0,
-                   TB_JMP_PAGE_SIZE * sizeof(njc->array[0]));
-        }
+        tb_jmp_cache_flush_page_bank(cpu, jc, cache->bank[i].njc, pc);
     }
 }
 
@@ -719,6 +712,9 @@ static void tlb_flush_by_mmuidx_work(CPUState *cpu, uint16_t asked,
 
     if (flush_hamt && hamt_enabled() && hamt_is_running()) {
         hamt_flush_tlb_all();
+        if (asked == ALL_MMUIDX_BITS) {
+            env->hamt_large_page_bits = 0;
+        }
     }
 
     all_dirty = env_tlb(env)->c.dirty;
@@ -769,62 +765,24 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     tlb_flush_by_mmuidx_work(cpu, data.host_int, true);
 }
 
-/* INVPCID supplies a 12-bit PCID, independent of the current CR3 root. */
-void tlb_flush_pcid(CPUState *cpu, unsigned pcid)
+static void pcid_flush_shared_code_caches(CPUState *cpu)
 {
-    CPUArchState *env = cpu->env_ptr;
-    struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
-    unsigned active_slot = env->cr[3] & (X86_PCID_SLOTS - 1);
-    unsigned slot = pcid & (X86_PCID_SLOTS - 1);
-
-    /* PCIDE may have just been enabled with the untagged ASID still live. */
-    if (!option_pcid_asid || !(env->cr[4] & CR4_PCIDE_MASK) ||
-        !hamt_is_running() ||
-        env->hamt_guest_asid != X86_HAMT_ASID_BASE + active_slot ||
-        env->pcid_context[active_slot] != env->cr[3] ||
-        (cache && cache->active != active_slot + 1)) {
-        tlb_flush(cpu);
-        return;
+    if (option_soft_ras) {
+        latxs_flush_soft_ras(cpu);
     }
-
-    /* Slot replacement already discarded both caches of the former owner. */
-    if ((env->pcid_context[slot] & 0xfff) != pcid) {
-        return;
-    }
-
-    if (slot != active_slot) {
-        /* Selection flushes this ASID and bank before either is reused. */
-        env->pcid_valid &= ~(1U << slot);
-        if (cache) {
-            qemu_spin_lock(&env_tlb(env)->c.lock);
-            cache->bank[slot + 1].epoch = 0;
-            qemu_spin_unlock(&env_tlb(env)->c.lock);
-        }
-        return;
-    }
-    hamt_flush_tlb_asid(env->hamt_guest_asid);
-    if (cache) {
-        qemu_spin_lock(&env_tlb(env)->c.lock);
-        pcid_flush_active_bank_locked(cpu, get_clock_realtime());
-        qemu_spin_unlock(&env_tlb(env)->c.lock);
-    }
-    latx_mem_clear_hpet_vpages();
-    tlb_flush_unbanked_pcid_caches(cpu);
+#ifdef CONFIG_LATX_TU
+    tu_generation_invalidate(cpu);
+#endif
 }
 
 /* The caller has already handled the hardware ASID and any software bank. */
 void tlb_flush_unbanked_pcid_caches(CPUState *cpu)
 {
     if (cpu->latx_pcid_caches) {
-        if (option_soft_ras) {
-            latxs_flush_soft_ras(cpu);
-        }
-#ifdef CONFIG_LATX_TU
-        tu_generation_invalidate(cpu);
-#endif
-        return;
+        pcid_flush_shared_code_caches(cpu);
+    } else {
+        tlb_flush_by_mmuidx_work(cpu, ALL_MMUIDX_BITS, false);
     }
-    tlb_flush_by_mmuidx_work(cpu, ALL_MMUIDX_BITS, false);
 }
 
 void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
@@ -919,41 +877,35 @@ static inline bool tlb_flush_entry_locked(CPUTLBEntry *tlb_entry, vaddr page)
     return tlb_flush_entry_mask_locked(tlb_entry, page, -1);
 }
 
-/* Called with tlb_c.lock held */
-
-#ifdef CONFIG_VICTIM_TLB
-static void tlb_flush_vtlb_page_mask_locked(CPUArchState *env, int mmu_idx,
-                                            vaddr page,
-                                            vaddr mask)
+/* Called with tlb_c.lock held; d may also belong to an inactive PCID. */
+static inline void tlb_flush_vtlb_page_mask_locked(CPUTLBDesc *d,
+                                                   vaddr page, vaddr mask)
 {
-    CPUTLBDesc *d = &env_tlb(env)->d[mmu_idx];
-    int k;
-
-    assert_cpu_is_self(env_cpu(env));
-    for (k = 0; k < CPU_VTLB_SIZE; k++) {
+#ifdef CONFIG_VICTIM_TLB
+    for (unsigned k = 0; k < CPU_VTLB_SIZE; k++) {
         if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
-            tlb_n_used_entries_dec(env, mmu_idx);
+            d->n_used_entries--;
         }
     }
-}
-
-static inline void tlb_flush_vtlb_page_locked(CPUArchState *env, int mmu_idx,
-                                              vaddr page)
-{
-    tlb_flush_vtlb_page_mask_locked(env, mmu_idx, page, -1);
-}
-#else
-static void tlb_flush_vtlb_page_mask_locked(CPUArchState *env, int mmu_idx,
-                                            vaddr page,
-                                            vaddr mask)
-{
-}
-
-static inline void tlb_flush_vtlb_page_locked(CPUArchState *env, int mmu_idx,
-                                              vaddr page)
-{
-}
 #endif
+}
+
+static inline void tlb_flush_vtlb_page_locked(CPUArchState *env, int mmu_idx,
+                                              vaddr page)
+{
+    tlb_flush_vtlb_page_mask_locked(&env_tlb(env)->d[mmu_idx], page, -1);
+}
+
+static void tlb_flush_4k_entry_locked(CPUTLBDesc *d, CPUTLBDescFast *fast,
+                                      vaddr page)
+{
+    uintptr_t index = (page >> TARGET_PAGE_BITS) & (tlb_n_entries(fast) - 1);
+
+    if (tlb_flush_entry_locked(&fast->table[index], page)) {
+        d->n_used_entries--;
+    }
+    tlb_flush_vtlb_page_mask_locked(d, page, -1);
+}
 
 /* Return true if the cached mapping extends beyond the requested page. */
 static bool tlb_flush_page_locked(CPUArchState *env, int midx, vaddr page)
@@ -969,12 +921,107 @@ static bool tlb_flush_page_locked(CPUArchState *env, int midx, vaddr page)
         tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime());
         return true;
     }
-    if (tlb_flush_entry_locked(tlb_entry(env, midx, page), page)) {
-        tlb_n_used_entries_dec(env, midx);
-    }
-    tlb_flush_vtlb_page_locked(env, midx, page);
+    tlb_flush_4k_entry_locked(&env_tlb(env)->d[midx], &env_tlb(env)->f[midx],
+                              page);
     cpu_fast_itlb_flush_page(env_cpu(env), page & TARGET_PAGE_MASK, midx);
     return false;
+}
+
+/* NULL bank selects the live descriptors. Never publish inactive roots. */
+static void pcid_flush_bank_page(CPUState *cpu, LatxPcidBank *bank, vaddr page)
+{
+    CPUTLB *tlb = env_tlb(cpu->env_ptr);
+    CPUTLBDescFast *fast = bank ? bank->f : tlb->f;
+    CPUTLBDesc *desc = bank ? bank->d : tlb->d;
+    CPUJumpCache *jc = bank ? bank->jc : cpu->tb_jmp_cache;
+    LatxNJC *njc = bank ? bank->njc : cpu->latx_njc_cache;
+
+    for (unsigned i = 0; i < NB_MMU_MODES; i++) {
+        fast_itlb_entry_t *itlb = fast[i].itlb;
+
+        tlb_flush_4k_entry_locked(&desc[i], &fast[i], page);
+        if (option_fast_itlb && itlb) {
+            itlb[FAST_ITLB_INDEX(page)].mix = 0;
+        }
+    }
+    if (jmp_cache_needs_full_flush()) {
+        tb_jmp_cache_flush_bank(jc, njc);
+    } else {
+        /* A TB starting on the preceding page can cross into this page. */
+        tb_jmp_cache_flush_page_bank(cpu, jc, njc, page - TARGET_PAGE_SIZE);
+        tb_jmp_cache_flush_page_bank(cpu, jc, njc, page);
+    }
+}
+
+/* INVPCID supplies a 12-bit PCID, independent of the current CR3 root. */
+void tlb_flush_pcid(CPUState *cpu, unsigned pcid, const vaddr *addr)
+{
+    CPUArchState *env = cpu->env_ptr;
+    struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
+    unsigned active_slot = env->cr[3] & (X86_PCID_SLOTS - 1);
+    unsigned slot = pcid & (X86_PCID_SLOTS - 1);
+    bool active = slot == active_slot;
+    uint32_t large;
+
+    /* PCIDE may have just been enabled with the untagged ASID still live. */
+    if (!option_pcid_asid || !(env->cr[4] & CR4_PCIDE_MASK) ||
+        !hamt_is_running() ||
+        env->hamt_guest_asid != X86_HAMT_ASID_BASE + active_slot ||
+        env->pcid_context[active_slot] != env->cr[3] ||
+        (cache && cache->active != active_slot + 1)) {
+        tlb_flush(cpu);
+        return;
+    }
+
+    /* Slot replacement already discarded both caches of the former owner. */
+    if ((env->pcid_context[slot] & 0xfff) != pcid) {
+        return;
+    }
+
+    /* Without software banks one conservative summary covers every ASID. */
+    large = !active && cache ? cache->bank[slot + 1].large_page_bits
+                             : env->hamt_large_page_bits;
+    if (addr && !(large & hamt_large_page_bit(*addr))) {
+        vaddr page = *addr & TARGET_PAGE_MASK;
+
+        if (option_pcid_stats) {
+            qatomic_inc(&env_archcpu(env)->pcid_profile.invpcid_page);
+        }
+        hamt_flush_tlb_asid_page(X86_HAMT_ASID_BASE + slot, page);
+        if (active || (cache && cache->bank[slot + 1].initialized)) {
+            qemu_spin_lock(&env_tlb(env)->c.lock);
+            pcid_flush_bank_page(cpu, active ? NULL : &cache->bank[slot + 1],
+                                 page);
+            qemu_spin_unlock(&env_tlb(env)->c.lock);
+        }
+        if (active) {
+            latx_mem_clear_hpet_vpage(page);
+            pcid_flush_shared_code_caches(cpu);
+        }
+        return;
+    }
+
+    if (addr && option_pcid_stats) {
+        qatomic_inc(&env_archcpu(env)->pcid_profile.invpcid_large);
+    }
+    if (!active) {
+        /* Selection flushes this ASID and bank before either is reused. */
+        env->pcid_valid &= ~(1U << slot);
+        if (cache) {
+            qemu_spin_lock(&env_tlb(env)->c.lock);
+            cache->bank[slot + 1].epoch = 0;
+            qemu_spin_unlock(&env_tlb(env)->c.lock);
+        }
+        return;
+    }
+    hamt_flush_tlb_asid(env->hamt_guest_asid);
+    if (cache) {
+        qemu_spin_lock(&env_tlb(env)->c.lock);
+        pcid_flush_active_bank_locked(cpu, get_clock_realtime());
+        qemu_spin_unlock(&env_tlb(env)->c.lock);
+    }
+    latx_mem_clear_hpet_vpages();
+    tlb_flush_unbanked_pcid_caches(cpu);
 }
 
 /**
@@ -1239,7 +1286,7 @@ static void tlb_flush_range_locked(CPUArchState *env, int midx,
         if (tlb_flush_entry_mask_locked(entry, page, mask)) {
             tlb_n_used_entries_dec(env, midx);
         }
-        tlb_flush_vtlb_page_mask_locked(env, midx, page, mask);
+        tlb_flush_vtlb_page_mask_locked(&env_tlb(env)->d[midx], page, mask);
     }
 }
 
@@ -1645,6 +1692,12 @@ static void tlb_add_large_page(CPUArchState *env, int mmu_idx,
 {
     vaddr lp_addr = env_tlb(env)->d[mmu_idx].large_page_addr;
     vaddr lp_mask = ~(size - 1);
+
+    /* Hardware and jump-cache entries can outlive this MMU descriptor. */
+    if (option_pcid_asid) {
+        env->hamt_large_page_bits |= size == (1ULL << HAMT_LARGE_PAGE_SHIFT)
+                                     ? hamt_large_page_bit(addr) : UINT32_MAX;
+    }
 
     if (lp_addr == (vaddr)-1) {
         /* No previous large page.  */

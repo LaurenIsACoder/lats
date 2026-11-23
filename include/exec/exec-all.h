@@ -126,7 +126,7 @@ void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr);
  * use one of the other functions for efficiency.
  */
 void tlb_flush(CPUState *cpu);
-void tlb_flush_pcid(CPUState *cpu, unsigned pcid);
+void tlb_flush_pcid(CPUState *cpu, unsigned pcid, const vaddr *addr);
 void tlb_flush_unbanked_pcid_caches(CPUState *cpu);
 bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain);
 void latx_pcid_cache_init(CPUState *cpu);

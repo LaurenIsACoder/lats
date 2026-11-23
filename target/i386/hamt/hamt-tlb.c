@@ -128,6 +128,13 @@ void hamt_flush_tlb_asid(unsigned asid)
                          : "memory");
 }
 
+void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr)
+{
+    /* Op 5 invalidates the local non-global entry matching ASID and VA. */
+    __asm__ __volatile__("invtlb 0x5, %0, %1" :: "r"((uint64_t)asid),
+                         "r"(addr) : "memory");
+}
+
 bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
 {
     unsigned slot = cr3 & (X86_PCID_SLOTS - 1);

@@ -2044,6 +2044,13 @@ static inline int target_get_curr_mtcc_id(CPUX86State *env)
 
 struct kvm_msrs;
 
+#ifdef CONFIG_SOFTMMU
+/* Keep host diagnostics outside the env layout used by saved code. */
+typedef struct X86PcidProfile {
+    uint64_t invpcid_page, invpcid_large;
+} X86PcidProfile;
+#endif
+
 /**
  * X86CPU:
  * @env: #CPUX86State
@@ -2196,6 +2203,9 @@ struct ArchCPU {
     int32_t hv_max_vps;
 
     bool xen_vapic;
+#ifdef CONFIG_SOFTMMU
+    X86PcidProfile pcid_profile;
+#endif
 };
 
 

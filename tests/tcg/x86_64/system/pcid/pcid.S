@@ -11,6 +11,8 @@
 #define DESC   0xd000
 #define IDT    0xe000
 #define ALIAS  0x400000
+#define PROBE_PTE (PT_B + 8*8)
+#define PROBE_VA (ALIAS + 0x8000)
 /* Executable pages are in normal RAM, above the BIOS tracking region. */
 #define CODE_A 0x109000
 #define CODE_B 0x10a000
@@ -197,6 +199,9 @@
 #ifdef PCID_CACHE_SMC
     movl $1,0x21108
 #endif
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    orl $2,0x21108
+#endif
     gate 6 .Lud
     gate 12 .Lss
     gate 13 .Lgp
@@ -242,6 +247,12 @@
     movl $CR3_A,%eax
     movq %rax,%cr3
     call .Llarge_page
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    /* Discard large translations left by the INVLPG test. */
+    movq $0,DESC
+    movl $2,%eax
+    invpcid DESC,%rax
+#endif
     movl $0x000011b8,CODE_A
     movl $0x0000c300,CODE_A+4
     movl $0x000022b8,CODE_B
@@ -277,11 +288,20 @@
 #ifdef PCID_INVPCID_TYPE
     /* Initial code-page protection can evict hardware ASIDs. Allow warmup
      * before requiring 4096 retained switches back to A. */
+#if PCID_INVPCID_TYPE == 0
+    /* Probe a non-adjacent B page for retention in the target ASID. */
+    movq $0x120003,PROBE_PTE
+    movl $0,0x2110c
+#endif
     movl $4112,%ecx
 #else
     movl $4096,%ecx
 #endif
 .Lswitch_pair:
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    /* Clear Accessed without INVLPG: an existing translation may stay hot. */
+    andq $~0x20,PROBE_PTE
+#endif
 #ifdef PCID_INVPCID_TYPE
     /* B is inactive and still maps CODE_B. Remap B while A stays hot. */
     movq $2,DESC
@@ -311,6 +331,14 @@
     call *%rsi
     cmpl $0x22,%eax
     jne .Lfail
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    /* A page walk here would set Accessed on the unrelated B page. */
+    movl PROBE_VA,%edx
+    testb $0x20,PROBE_PTE
+    jnz 1f
+    incl 0x2110c
+1:
+#endif
     movabsq $(NOFLUSH | CR3_A),%rax
     movq %rax,%cr3
     call *%rsi
@@ -326,6 +354,10 @@
     orq %rdx,%rax
     subq 0x21100,%rax
     movq %rax,0x21100
+#endif
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    call .Linvpcid_cross_page
+    call .Linvpcid_split_large
 #endif
 #ifdef PCID_CACHE_SMC
     /* Modify A through the identity alias while B owns the CPU. */
@@ -369,10 +401,45 @@
     fault 14,3
     movb $1,64(%rsi)
     checkfault
+    movq PT_A,%r8
+    movq PT_B,%r9
+    movq $CODE_A+3,PT_A
+    movq $CODE_B+3,PT_B
     movl $2,%eax
     invpcid DESC,%rax
+
+    .macro check_type3_page expected
+        cmpb $\expected,64(%rsi)
+        jne .Lfail
+        call *%rsi
+        cmpl $\expected,%eax
+        jne .Lfail
+    .endm
+    /* Populate two distinct PCIDs with non-global mappings of the same VA. */
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    check_type3_page 0x22
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    check_type3_page 0x11
+
+    /* Swap both PTEs without an intervening invalidation. */
+    movq $CODE_B+3,PT_A
+    movq $CODE_A+3,PT_B
     movl $3,%eax
     invpcid DESC,%rax
+    check_type3_page 0x22
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    check_type3_page 0x11
+    .purgem check_type3_page
+
+    movq %r8,PT_A
+    movq %r9,PT_B
+    movl $2,%eax
+    invpcid DESC,%rax
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
     movl $4,%eax
     fault 13
     invpcid DESC,%rax
@@ -678,6 +745,83 @@
     movq $0,0x3008
     invlpg (CODE_A+0x200000)
     ret
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+/* The cached entry PC is on the preceding page. Only the immediate of the
+ * MOV and its RET move to a different physical page. */
+.Linvpcid_cross_page:
+    movb $0xb8,CODE_B+0xfff
+    movl $0x33,0x112000
+    movb $0xc3,0x112004
+    movl $0x44,0x113000
+    movb $0xc3,0x113004
+    movq $0x112003,PT_B+8
+    movl $CR3_B,%eax
+    movq %rax,%cr3
+    movl $(ALIAS+0xfff),%edi
+    call *%rdi
+    cmpl $0x33,%eax
+    jne .Lfail
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    movq $0x113003,PT_B+8
+    movq $2,DESC
+    movq $ALIAS+0x1007,DESC+8
+    xorl %eax,%eax
+    invpcid DESC,%rax
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    call *%rdi
+    cmpl $0x44,%eax
+    jne .Lfail
+    movq $0,PT_B+8
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    ret
+
+/* Split a cached 2M leaf in B. Invalidate a different 4K subpage and
+ * check the old instruction and data aliases, first in active B, then in
+ * inactive B. Walking the new page tables alone would miss the old 2M leaf. */
+.Linvpcid_split_large:
+    xorl %ebp,%ebp
+1:
+    movq $0x83,0x6010
+    movl $CR3_B,%eax
+    movq %rax,%cr3
+    movl $(ALIAS+CODE_A),%edi
+    cmpb $0x11,64(%rdi)
+    jne .Lfail
+    call *%rdi
+    cmpl $0x11,%eax
+    jne .Lfail
+    testl %ebp,%ebp
+    jz 2f
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+2:
+    movq $CODE_B+3,PT_B+8*(CODE_A>>12)
+    movq $PT_B+3,0x6010
+    movq $2,DESC
+    movq $ALIAS+0x2000,DESC+8
+    xorl %eax,%eax
+    invpcid DESC,%rax
+    testl %ebp,%ebp
+    jz 3f
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+3:
+    cmpb $0x22,64(%rdi)
+    jne .Lfail
+    call *%rdi
+    cmpl $0x22,%eax
+    jne .Lfail
+    incl %ebp
+    cmpl $2,%ebp
+    jne 1b
+    movq $0,PT_B+8*(CODE_A>>12)
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    ret
+#endif
 .Luser_test:
     /* RAM GDT: LTR writes the TSS busy bit. */
     leaq .Lgdt(%rip),%rsi

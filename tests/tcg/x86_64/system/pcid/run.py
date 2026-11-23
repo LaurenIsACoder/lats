@@ -108,9 +108,12 @@ def run(binary, rom, mode, engine, timeout, cache=False, reset=False, la57=False
                         raise RuntimeError('guest reported incorrect state:\n' +
                                            hmp('info registers -a'))
                     stats = read_stats(hmp('info jit'))
-                    words = hmp('xp /3wx 0x21100').split(':')[1].split()
+                    words = hmp('xp /4wx 0x21100').split(':')[1].split()
                     elapsed = int(words[0], 16) | int(words[1], 16) << 32
-                    smc = int(words[2], 16) & 1
+                    flags = int(words[2], 16)
+                    smc = flags & 1
+                    page_test = flags & 2
+                    probe_hits = int(words[3], 16) if page_test else None
                     reset_stats = None
                     if reset:
                         request(stream, 'system_reset')
@@ -142,11 +145,23 @@ def run(binary, rom, mode, engine, timeout, cache=False, reset=False, la57=False
                 raise RuntimeError('ASID retention not exercised')
             if cache and stats[0]['cache_retained'] < 4096:
                 raise RuntimeError('software cache retention not exercised')
+            if mode == 'C' and page_test:
+                bsp = stats[0]
+                if bsp.get('invpcid_page', 0) < 8192 or bsp['retained'] < 8192:
+                    raise RuntimeError('4K INVPCID lost a PCID context')
+                # Hardware can evict the probe independently of INVPCID.
+                # Require it to stay hot on at least 90% of switch pairs.
+                if probe_hits * 10 < 4112 * 9:
+                    raise RuntimeError(
+                        f'unrelated 4K page retained only {probe_hits} times')
+                if bsp.get('invpcid_large', 0) < 2:
+                    raise RuntimeError('large mappings did not widen INVPCID')
             if cache and smc and not stats[1]['cache_retained']:
                 raise RuntimeError('inactive AP bank was not retained over SMC')
             return {'mode': mode, 'engine': engine, 'cache': cache,
                     'stats': stats, 'reset_stats': reset_stats, 'la57': la57,
                     'ap_unplugged': bool(cache and smc),
+                    'unrelated_page_hits': probe_hits,
                     'switch_pair_tsc_ticks': elapsed,
                     'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
         finally:

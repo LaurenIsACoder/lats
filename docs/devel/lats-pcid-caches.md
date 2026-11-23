@@ -13,11 +13,17 @@ the bank. Fast instruction and jump lookups load the active bank root.
 A retained bank requires both an architectural no-flush request with an
 exact CR3 identity and a current software invalidation generation. A missing,
 recycled or expired bank is cleared before reuse, and its hardware tag is
-invalidated. With a tagged context active, INVPCID types 0 and 1 flush
-the target PCID's entire context. An inactive target's bank and ASID are
-marked stale and cleared before reuse. A different PCID in the same slot
-remains valid. Explicit full/page/range mapping invalidations expire inactive
-banks lazily. On an INVLPG that covers a cached large page, all active jump
+invalidated. With a tagged context active, INVPCID type 0 invalidates the
+address in the target ASID and software bank, including an inactive bank.
+The page walkers record large-leaf regions at fill time. A bitmap collision
+or a possible large mapping widens the invalidation to the target context,
+even if the guest has since split the mapping. Software banks save the
+bitmap with their descriptors; ASID-only mode shares a conservative bitmap.
+Jump-cache invalidation includes the preceding page for crossing TBs;
+non-page hashes and multi-page TU dependencies clear the bank's jump caches.
+Type 1 always invalidates the target context. Whole inactive contexts are
+marked stale before reuse. A different PCID in the same slot remains valid.
+Explicit full/page/range mapping invalidations expire inactive banks lazily. On an INVLPG that covers a cached large page, all active jump
 buckets are cleared, including destinations elsewhere in the same mapping.
 Untagged HAMT walkers record the virtual regions of large-page fills in a
 per-vCPU bitmap. An INVLPG outside those regions can keep unrelated hardware
@@ -42,9 +48,8 @@ Reset and VM-state load expire the banks. CPU unrealize frees every backing
 table exactly once. Software cache banks are not migrated. The switch still
 resets the RAS and TU mapping-check generation. The first supported profile
 is x86-64 HAMT DMW with pinned vCPUs and compact NJC. Saved AOT code records
-the bank-layout option and relocates fast iTLB indices. The option is explicit
-and default-off. An unchanged conservative backend
-remains available for correctness and performance comparisons.
+the bank-layout option and relocates fast iTLB indices. Disable the banks with `pcidcache=off` to exercise the
+conservative software-cache path.
 
 The ROM tests and runner in `tests/tcg/x86_64/system/pcid/` check architectural
 faults, slot reuse, permissions, global invalidation, cross-vCPU SMC and reset.

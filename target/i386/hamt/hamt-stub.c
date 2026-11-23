@@ -71,6 +71,11 @@ void hamt_flush_tlb_asid(unsigned asid)
     g_assert_not_reached();
 }
 
+void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr)
+{
+    g_assert_not_reached();
+}
+
 void hamt_flush_tlb_all(void)
 {
 }
