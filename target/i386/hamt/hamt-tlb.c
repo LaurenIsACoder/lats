@@ -139,10 +139,12 @@ bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
 {
     unsigned slot = cr3 & (X86_PCID_SLOTS - 1);
     unsigned asid = X86_HAMT_ASID_BASE + slot;
-    unsigned bits = extract32(read_csr_asid(), 16, 8);
+    unsigned cached_asid = env->hamt_guest_asid;
 
-    /* ASID 0 belongs to the translator and 0xf to the untagged guest. */
-    if (bits < 5) {
+    /* A tagged ASID records a successful width check on this pinned vCPU. */
+    if ((cached_asid < X86_HAMT_ASID_BASE ||
+         cached_asid >= X86_HAMT_ASID_BASE + X86_PCID_SLOTS) &&
+        extract32(read_csr_asid(), 16, 8) < 5) {
         return false;
     }
     bool same_context = noflush && env->pcid_context[slot] == cr3;

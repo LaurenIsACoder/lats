@@ -489,13 +489,20 @@ bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain)
     CPUArchState *env = cpu->env_ptr;
     CPUTLB *tlb = env_tlb(env);
     LatxPcidBank *bank;
-    int64_t now = get_clock_realtime();
+    int64_t now;
+    bool switching;
 
     g_assert(cache && slot < X86_PCID_SLOTS && qemu_cpu_is_self(cpu));
     qemu_spin_lock(&tlb->c.lock);
-    pcid_save_tlb(cpu, &cache->bank[cache->active]);
-    cache->active = slot + 1;
+    switching = cache->active != slot + 1;
+    if (switching) {
+        pcid_save_tlb(cpu, &cache->bank[cache->active]);
+        cache->active = slot + 1;
+    }
     bank = &cache->bank[cache->active];
+    retain = retain && bank->initialized && bank->epoch == cache->epoch;
+    /* Only allocation and flush need the TLB resize window timestamp. */
+    now = retain ? 0 : get_clock_realtime();
     if (!bank->initialized) {
         CPUJumpCache *jc;
         LatxNJC *njc;
@@ -514,14 +521,17 @@ bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain)
             tlb_mmu_init(env, i, &tlb->d[i], &tlb->f[i], now);
         }
         bank->initialized = true;
-        retain = false;
+        /* All new tables, including the jump caches, are already empty. */
+        bank->epoch = cache->epoch;
+        env->hamt_large_page_bits = 0;
     } else {
-        pcid_publish_roots(cpu, bank);
-        pcid_load_tlb(cpu, bank);
-    }
-    retain &= bank->epoch == cache->epoch;
-    if (!retain) {
-        pcid_flush_active_bank_locked(cpu, now);
+        if (switching) {
+            pcid_publish_roots(cpu, bank);
+            pcid_load_tlb(cpu, bank);
+        }
+        if (!retain) {
+            pcid_flush_active_bank_locked(cpu, now);
+        }
     }
     if (option_pcid_stats) {
         if (retain) {
