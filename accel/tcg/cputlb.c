@@ -190,7 +190,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * conflict misses.
  */
 #ifndef CONFIG_LATX_RR
-static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+static bool tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
                                   int64_t now)
 {
     size_t old_size = tlb_n_entries(fast);
@@ -231,7 +231,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         if (window_expired) {
             tlb_window_reset(desc, now, desc->n_used_entries);
         }
-        return;
+        return false;
     }
 
     g_free(fast->table);
@@ -263,6 +263,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         fast->table = g_try_new(CPUTLBEntry, new_size);
         desc->fulltlb = g_try_new(CPUTLBEntryFull, new_size);
     }
+    return true;
 }
 #endif
 
@@ -282,15 +283,21 @@ static void tlb_mmu_flush_locked(CPUArchState *env,
 }
 
 static void tlb_flush_one_mmuidx_locked(CPUArchState *env, int mmu_idx,
-                                        int64_t now)
+                                        int64_t now, bool dirty)
 {
     CPUTLBDesc *desc = &env_tlb(env)->d[mmu_idx];
     CPUTLBDescFast *fast = &env_tlb(env)->f[mmu_idx];
 
 #ifndef CONFIG_LATX_RR
-    tlb_mmu_resize_locked(desc, fast, now);
+    /* A newly allocated table still needs its invalid-entry sentinels. */
+    dirty |= tlb_mmu_resize_locked(desc, fast, now);
 #endif
-    tlb_mmu_flush_locked(env, desc, fast);
+    if (dirty) {
+        tlb_mmu_flush_locked(env, desc, fast);
+    } else {
+        /* HAMT can fill the instruction TLB without a software TLB insert. */
+        cpu_fast_itlb_flush_ptr(fast->itlb);
+    }
 }
 
 static void tlb_mmu_init(CPUArchState *env, int index,
@@ -429,6 +436,22 @@ static void pcid_load_tlb(CPUState *cpu, LatxPcidBank *bank)
     env->hamt_large_page_bits = bank->large_page_bits;
 }
 
+static void pcid_clear_active_tables_locked(CPUState *cpu, int64_t now)
+{
+    CPUArchState *env = cpu->env_ptr;
+
+    /*
+     * Each live descriptor points to its bank's fast iTLB. Visiting all MMU
+     * modes clears both user and kernel iTLBs, regardless of dirty bits.
+     */
+    for (unsigned i = 0; i < NB_MMU_MODES; i++) {
+        tlb_flush_one_mmuidx_locked(env, i, now,
+                                    env_tlb(env)->c.dirty & (1u << i));
+    }
+    env_tlb(env)->c.dirty = 0;
+    tb_jmp_cache_flush_current(cpu);
+}
+
 void latx_pcid_cache_reset(CPUState *cpu)
 {
     struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
@@ -445,13 +468,7 @@ void latx_pcid_cache_reset(CPUState *cpu)
     pcid_load_tlb(cpu, &cache->bank[0]);
     pcid_cache_expire_locked(cpu);
     /* Reset executes in bank 0 before another tagged selection can occur. */
-    for (unsigned i = 0; i < NB_MMU_MODES; i++) {
-        tlb_flush_one_mmuidx_locked(cpu->env_ptr, i, get_clock_realtime());
-    }
-    tlb->c.dirty = 0;
-    cpu_fast_itlb_flush(cpu, MMU_KNOSMAP_IDX);
-    cpu_fast_itlb_flush(cpu, MMU_USER_IDX);
-    tb_jmp_cache_flush_current(cpu);
+    pcid_clear_active_tables_locked(cpu, get_clock_realtime());
     qemu_spin_unlock(&tlb->c.lock);
 }
 
@@ -460,13 +477,7 @@ static void pcid_flush_active_bank_locked(CPUState *cpu, int64_t now)
     CPUArchState *env = cpu->env_ptr;
     struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
 
-    for (unsigned i = 0; i < NB_MMU_MODES; i++) {
-        tlb_flush_one_mmuidx_locked(env, i, now);
-    }
-    env_tlb(env)->c.dirty = 0;
-    cpu_fast_itlb_flush(cpu, MMU_KNOSMAP_IDX);
-    cpu_fast_itlb_flush(cpu, MMU_USER_IDX);
-    tb_jmp_cache_flush_current(cpu);
+    pcid_clear_active_tables_locked(cpu, now);
     /* Reset history only when both software and hardware are invalidated. */
     env->hamt_large_page_bits = 0;
     cache->bank[cache->active].epoch = cache->epoch;
@@ -724,7 +735,7 @@ static void tlb_flush_by_mmuidx_work(CPUState *cpu, uint16_t asked,
 
     for (work = to_clean; work != 0; work &= work - 1) {
         int mmu_idx = ctz32(work);
-        tlb_flush_one_mmuidx_locked(env, mmu_idx, now);
+        tlb_flush_one_mmuidx_locked(env, mmu_idx, now, true);
     }
 
     /*
@@ -918,7 +929,7 @@ static bool tlb_flush_page_locked(CPUArchState *env, int midx, vaddr page)
         tlb_debug("forcing full flush midx %d (%016"
                   VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, lp_addr, lp_mask);
-        tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime());
+        tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime(), true);
         return true;
     }
     tlb_flush_4k_entry_locked(&env_tlb(env)->d[midx], &env_tlb(env)->f[midx],
@@ -1262,7 +1273,7 @@ static void tlb_flush_range_locked(CPUArchState *env, int midx,
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
                   midx, addr, mask, len);
-        tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime());
+        tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime(), true);
         return;
     }
 
@@ -1275,7 +1286,7 @@ static void tlb_flush_range_locked(CPUArchState *env, int midx,
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, d->large_page_addr, d->large_page_mask);
-        tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime());
+        tlb_flush_one_mmuidx_locked(env, midx, get_clock_realtime(), true);
         return;
     }
 
