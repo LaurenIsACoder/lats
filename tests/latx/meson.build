@@ -35,3 +35,8 @@ if targetos == 'linux' and 'CONFIG_LATX_OPT_BQL' in config_host
   test('test-qemu-cond-bql', test_qemu_cond_bql,
        suite: ['unit', 'latx-thread'], timeout: 15)
 endif
+
+if have_system and 'CONFIG_LATX_TU' in config_host
+  test('test-tb-collision-tu-pages', python,
+       args: files('test-tb-collision-tu-pages.py'), suite: ['unit'])
+endif
