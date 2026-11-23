@@ -56,6 +56,7 @@
 #include "latx/include/latx-options.h"
 #include "latx/include/latx-ras.h"
 #include "latx/include/latx-tu.h"
+#include "latx/include/latx-sys-mmio.h"
 
 #ifdef CONFIG_LATX_PROFILER
 static uint64_t tcg_cputlb_static_rdtime(void)
@@ -449,6 +450,21 @@ void latx_pcid_cache_reset(CPUState *cpu)
     qemu_spin_unlock(&tlb->c.lock);
 }
 
+static void pcid_flush_active_bank_locked(CPUState *cpu, int64_t now)
+{
+    CPUArchState *env = cpu->env_ptr;
+    struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
+
+    for (unsigned i = 0; i < NB_MMU_MODES; i++) {
+        tlb_flush_one_mmuidx_locked(env, i, now);
+    }
+    env_tlb(env)->c.dirty = 0;
+    cpu_fast_itlb_flush(cpu, MMU_KNOSMAP_IDX);
+    cpu_fast_itlb_flush(cpu, MMU_USER_IDX);
+    tb_jmp_cache_flush_current(cpu);
+    cache->bank[cache->active].epoch = cache->epoch;
+}
+
 bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain)
 {
     struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
@@ -487,14 +503,7 @@ bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain)
     }
     retain &= bank->epoch == cache->epoch;
     if (!retain) {
-        for (unsigned i = 0; i < NB_MMU_MODES; i++) {
-            tlb_flush_one_mmuidx_locked(env, i, now);
-        }
-        tlb->c.dirty = 0;
-        cpu_fast_itlb_flush(cpu, MMU_KNOSMAP_IDX);
-        cpu_fast_itlb_flush(cpu, MMU_USER_IDX);
-        tb_jmp_cache_flush_current(cpu);
-        bank->epoch = cache->epoch;
+        pcid_flush_active_bank_locked(cpu, now);
     }
     if (option_pcid_stats) {
         if (retain) {
@@ -760,8 +769,51 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
     tlb_flush_by_mmuidx_work(cpu, data.host_int, true);
 }
 
-/* Hardware ASID selection and, if enabled, software bank selection are done. */
-void tlb_flush_after_pcid_switch(CPUState *cpu)
+/* INVPCID supplies a 12-bit PCID, independent of the current CR3 root. */
+void tlb_flush_pcid(CPUState *cpu, unsigned pcid)
+{
+    CPUArchState *env = cpu->env_ptr;
+    struct LatxPcidCaches *cache = cpu->latx_pcid_caches;
+    unsigned active_slot = env->cr[3] & (X86_PCID_SLOTS - 1);
+    unsigned slot = pcid & (X86_PCID_SLOTS - 1);
+
+    /* PCIDE may have just been enabled with the untagged ASID still live. */
+    if (!option_pcid_asid || !(env->cr[4] & CR4_PCIDE_MASK) ||
+        !hamt_is_running() ||
+        env->hamt_guest_asid != X86_HAMT_ASID_BASE + active_slot ||
+        env->pcid_context[active_slot] != env->cr[3] ||
+        (cache && cache->active != active_slot + 1)) {
+        tlb_flush(cpu);
+        return;
+    }
+
+    /* Slot replacement already discarded both caches of the former owner. */
+    if ((env->pcid_context[slot] & 0xfff) != pcid) {
+        return;
+    }
+
+    if (slot != active_slot) {
+        /* Selection flushes this ASID and bank before either is reused. */
+        env->pcid_valid &= ~(1U << slot);
+        if (cache) {
+            qemu_spin_lock(&env_tlb(env)->c.lock);
+            cache->bank[slot + 1].epoch = 0;
+            qemu_spin_unlock(&env_tlb(env)->c.lock);
+        }
+        return;
+    }
+    hamt_flush_tlb_asid(env->hamt_guest_asid);
+    if (cache) {
+        qemu_spin_lock(&env_tlb(env)->c.lock);
+        pcid_flush_active_bank_locked(cpu, get_clock_realtime());
+        qemu_spin_unlock(&env_tlb(env)->c.lock);
+    }
+    latx_mem_clear_hpet_vpages();
+    tlb_flush_unbanked_pcid_caches(cpu);
+}
+
+/* The caller has already handled the hardware ASID and any software bank. */
+void tlb_flush_unbanked_pcid_caches(CPUState *cpu)
 {
     if (cpu->latx_pcid_caches) {
         if (option_soft_ras) {

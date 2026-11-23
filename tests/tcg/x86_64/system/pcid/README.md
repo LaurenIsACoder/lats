@@ -17,8 +17,10 @@ translation only on an explicitly no-flush CR3 write that hits the full
 guest CR3 identity. Slot replacement invalidates the hardware tag before
 publishing the new owner. Tag 0 remains for the translator and 15 for the
 untagged guest. Existing software TLBs, fast instruction caches and jump
-caches are invalidated on address-space switches. INVPCID handles all four
-types conservatively, including global mappings. Hardware cache contents
+caches are invalidated on address-space switches without software banks.
+With a tagged ASID active, INVPCID types 0 and 1 invalidate the target PCID
+at context granularity. Types 2 and 3 use a full local flush, as do types 0
+and 1 while running without a known tagged context. Hardware cache contents
 are transient across reset and VM state load.
 
 `pcidcache=on` additionally retains the software TLB, fast instruction
@@ -72,6 +74,16 @@ successful C run must actually reuse tags; a successful B/C HAMT run must
 exercise guest hardware refill. Treat the result as mechanism evidence.
 Windows adoption requires observing CR4.PCIDE and no-flush writes in the
 target Windows workload itself.
+
+To check targeted INVPCID, build the SMP/BENCH/WAIT ROM twice, adding
+`-DPCID_INVPCID_TYPE=0` and `-DPCID_INVPCID_TYPE=1` respectively. Run
+each ROM in mode C with `--cache`. Each of the 4112 switch pairs remaps the
+same address in B while inactive and again while active, checks instruction
+and data accesses, and invalidates an unbound PCID colliding with A. The
+runner requires at least 4096 hardware and software retentions on the BSP.
+The 16 extra pairs allow for hardware ASID eviction during initial code-page
+protection. A global flush returns the right data but fails the retention check.
+The resulting loop timings include remapping and invalidation.
 
 Add `-DPCID_LEGACY` at assembly time to run 32-bit protected-mode checks
 before entering long mode. These include a non-flat FS descriptor, a

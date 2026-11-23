@@ -121,6 +121,13 @@ static inline uint32_t guest_asid(void)
     return option_pcid_asid ? env->hamt_guest_asid : 0xf;
 }
 
+void hamt_flush_tlb_asid(unsigned asid)
+{
+    /* INVTLB op 4: local non-global entries for this ASID only. */
+    __asm__ __volatile__("invtlb 0x4, %0, $zero" :: "r"((uint64_t)asid)
+                         : "memory");
+}
+
 bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
 {
     unsigned slot = cr3 & (X86_PCID_SLOTS - 1);
@@ -143,9 +150,7 @@ bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
             qatomic_inc(&env->pcid_stats.retained);
         }
     } else {
-        /* INVTLB op 4: local non-global entries for this ASID only. */
-        __asm__ __volatile__("invtlb 0x4, %0, $zero" :: "r"((uint64_t)asid)
-                             : "memory");
+        hamt_flush_tlb_asid(asid);
         env->pcid_context[slot] = cr3;
         env->pcid_valid |= 1U << slot;
         if (option_pcid_stats) {

@@ -13,13 +13,16 @@ the bank. Fast instruction and jump lookups load the active bank root.
 A retained bank requires both an architectural no-flush request with an
 exact CR3 identity and a current software invalidation generation. A missing,
 recycled or expired bank is cleared before reuse, and its hardware tag is
-invalidated. Explicit full/page/range mapping invalidations expire inactive
+invalidated. With a tagged context active, INVPCID types 0 and 1 flush
+the target PCID's entire context. An inactive target's bank and ASID are
+marked stale and cleared before reuse. A different PCID in the same slot
+remains valid. Explicit full/page/range mapping invalidations expire inactive
 banks lazily. On an INVLPG that covers a cached large page, all active jump
 buckets are cleared, including destinations elsewhere in the same mapping.
 Untagged HAMT walkers record the virtual regions of large-page fills in a
 per-vCPU bitmap. An INVLPG outside those regions can keep unrelated hardware
 translations. Collisions and 1 GiB pages conservatively widen the flush.
-Tagged hardware ASIDs are invalidated together. Physical
+INVLPG invalidates all tagged hardware ASIDs. Physical
 dirty-tracking notifications update matching writable TLB entries in every
 live bank under the TLB lock, preserving unrelated mappings and jump caches.
 The dirty scan holds the CPU-list lock across traversal so unplug waits for

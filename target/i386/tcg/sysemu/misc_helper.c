@@ -136,7 +136,7 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         if (option_pcid_asid && (env->cr[4] & CR4_PCIDE_MASK) &&
             hamt_is_running() && hamt_switch_pcid(env, t0, noflush)) {
             env->cr[3] = t0;
-            tlb_flush_after_pcid_switch(env_cpu(env));
+            tlb_flush_unbanked_pcid_caches(env_cpu(env));
         } else {
             cpu_x86_update_cr3(env, t0);
         }
@@ -279,8 +279,12 @@ void helper_invpcid(CPUX86State *env, target_ulong addr, uint32_t reg,
     if (option_pcid_stats) {
         qatomic_inc(&env->pcid_stats.invpcid[type]);
     }
-    /* Over-invalidation is permitted for all four architectural types. */
-    tlb_flush(env_cpu(env));
+    if (type <= 1) {
+        /* Type 0 may invalidate other addresses in the same context. */
+        tlb_flush_pcid(env_cpu(env), pcid);
+    } else {
+        tlb_flush(env_cpu(env));
+    }
 }
 
 void helper_wrmsr(CPUX86State *env)

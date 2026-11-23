@@ -274,10 +274,38 @@
     shlq $32,%rdx
     orq %rdx,%rax
     movq %rax,0x21100
+#ifdef PCID_INVPCID_TYPE
+    /* Initial code-page protection can evict hardware ASIDs. Allow warmup
+     * before requiring 4096 retained switches back to A. */
+    movl $4112,%ecx
+#else
     movl $4096,%ecx
+#endif
 .Lswitch_pair:
+#ifdef PCID_INVPCID_TYPE
+    /* B is inactive and still maps CODE_B. Remap B while A stays hot. */
+    movq $2,DESC
+    movq $ALIAS,DESC+8
+    movq $CODE_A+3,PT_B
+    movl $PCID_INVPCID_TYPE,%eax
+    invpcid DESC,%rax
+#endif
     movabsq $(NOFLUSH | CR3_B),%rax
     movq %rax,%cr3
+#ifdef PCID_INVPCID_TYPE
+    cmpb $0x11,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl $0x11,%eax
+    jne .Lfail
+    /* Remap the active B back. A must survive both invalidations. */
+    movq $CODE_B+3,PT_B
+    movl $PCID_INVPCID_TYPE,%eax
+    invpcid DESC,%rax
+    /* Unbound PCID 17 shares A's slot but cannot invalidate A. */
+    movq $17,DESC
+    invpcid DESC,%rax
+#endif
     cmpb $0x22,64(%rsi)
     jne .Lfail
     call *%rsi

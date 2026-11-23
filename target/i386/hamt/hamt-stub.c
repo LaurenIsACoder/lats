@@ -66,6 +66,11 @@ bool hamt_switch_pcid(struct CPUArchState *env, uint64_t cr3, bool noflush)
     return false;
 }
 
+void hamt_flush_tlb_asid(unsigned asid)
+{
+    g_assert_not_reached();
+}
+
 void hamt_flush_tlb_all(void)
 {
 }
