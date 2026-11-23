@@ -92,6 +92,11 @@ With PCID statistics enabled,
 counts type 0 requests widened by the large-page bitmap. The loop timings
 include remapping and invalidation.
 
+For a burst of type 0 requests targeting an inactive bank, also define
+`PCID_INVPCID_BATCH` and run mode C with `--cache --full-hash`. The full hash
+requires invalidating the entire jump table. The bank must clear it before
+executing the remapped code when selected again.
+
 Add `-DPCID_LEGACY` at assembly time to run 32-bit protected-mode checks
 before entering long mode. These include a non-flat FS descriptor, a
 16-byte operand crossing its segment limit, a null selector, and attempts

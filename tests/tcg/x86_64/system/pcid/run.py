@@ -60,13 +60,16 @@ def check_reset(before, after, cache):
             raise RuntimeError('cache banks not reused after reset')
 
 
-def run(binary, rom, mode, engine, timeout, cache=False, reset=False, la57=False):
+def run(binary, rom, mode, engine, timeout, cache=False, reset=False,
+        la57=False, full_hash=False):
     with tempfile.TemporaryDirectory() as temp:
         work = Path(temp)
         marker = work / 'result'
         sockpath = work / 'qmp'
         latx = ['select', 'aotsys=0', 'tumode=off', 'pcidstats=on',
                 'pcid=off', 'pcidasid=off', 'pcidcache=off']
+        if full_hash:
+            latx.append('njchash=full')
         cpu = 'qemu64'
         if engine == 'lat':
             latx += ['hamt=1', 'hamtmode=1', 'hamtconfig=0x33e9']
@@ -183,6 +186,8 @@ if __name__ == '__main__':
                         help='expose LA57 while the ROM uses four-level paging')
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--reset', action='store_true')
+    parser.add_argument('--full-hash', action='store_true',
+                        help='use the full-address jump-cache hash')
     parser.add_argument('--timeout', type=int, default=30)
     parser.add_argument('--output', type=Path)
     opts = parser.parse_args()
@@ -191,7 +196,8 @@ if __name__ == '__main__':
     if opts.cache and opts.mode != 'C':
         parser.error('--cache requires C mode')
     result = run(opts.binary.resolve(), opts.rom.resolve(), opts.mode,
-                 opts.engine, opts.timeout, opts.cache, opts.reset, opts.la57)
+                 opts.engine, opts.timeout, opts.cache, opts.reset, opts.la57,
+                 opts.full_hash)
     encoded = json.dumps(result, indent=2) + '\n'
     if opts.output:
         opts.output.write_text(encoded)

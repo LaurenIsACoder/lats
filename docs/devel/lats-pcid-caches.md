@@ -20,7 +20,9 @@ or a possible large mapping widens the invalidation to the target context,
 even if the guest has since split the mapping. Software banks save the
 bitmap with their descriptors; ASID-only mode shares a conservative bitmap.
 Jump-cache invalidation includes the preceding page for crossing TBs;
-non-page hashes and multi-page TU dependencies clear the bank's jump caches.
+non-page hashes and multi-page TU dependencies require a full jump-cache
+clear. An inactive bank defers that clear until selection, coalescing
+requests while its cached code cannot run.
 Type 1 always invalidates the target context. Whole inactive contexts are
 marked stale before reuse. A different PCID in the same slot remains valid.
 Explicit full/page/range mapping invalidations expire inactive banks lazily. On an INVLPG that covers a cached large page, all active jump

@@ -351,6 +351,7 @@ typedef struct LatxPcidBank {
     void *user_itlb;
     void *kernel_itlb;
     bool initialized;
+    bool jump_flush_pending; /* Accessed by the owner under the TLB lock. */
 } LatxPcidBank;
 
 struct LatxPcidCaches {
@@ -535,6 +536,12 @@ bool latx_pcid_cache_select(CPUState *cpu, unsigned slot, bool retain)
         if (switching) {
             pcid_publish_roots(cpu, bank);
             pcid_load_tlb(cpu, bank);
+            if (bank->jump_flush_pending) {
+                if (retain) {
+                    tb_jmp_cache_flush_current(cpu);
+                }
+                bank->jump_flush_pending = false;
+            }
         }
         if (!retain) {
             pcid_flush_active_bank_locked(cpu, now);
@@ -975,7 +982,12 @@ static void pcid_flush_bank_page(CPUState *cpu, LatxPcidBank *bank, vaddr page)
         }
     }
     if (jmp_cache_needs_full_flush()) {
-        tb_jmp_cache_flush_bank(jc, njc);
+        if (bank) {
+            /* The owner clears the jump tables before reusing this bank. */
+            bank->jump_flush_pending = true;
+        } else {
+            tb_jmp_cache_flush_bank(jc, njc);
+        }
     } else {
         /* A TB starting on the preceding page can cross into this page. */
         tb_jmp_cache_flush_page_bank(cpu, jc, njc, page - TARGET_PAGE_SIZE);

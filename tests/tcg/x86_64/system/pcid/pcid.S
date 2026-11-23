@@ -309,6 +309,12 @@
     movq $CODE_A+3,PT_B
     movl $PCID_INVPCID_TYPE,%eax
     invpcid DESC,%rax
+#ifdef PCID_INVPCID_BATCH
+    /* More requests for B before it can fill its jump caches again. */
+    .rept 3
+    invpcid DESC,%rax
+    .endr
+#endif
 #endif
     movabsq $(NOFLUSH | CR3_B),%rax
     movq %rax,%cr3
