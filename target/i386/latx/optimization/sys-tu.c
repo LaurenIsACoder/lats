@@ -2404,6 +2404,8 @@ re_translate:
         }
     }
 
+    /* Member allocation may have switched the active code region. */
+    latxs_tr_sync_region_offset(tcg_ctx->mtcc_id);
     int translate_result =
         translate_tu(cpu, *tb_num_in_tu, tb_list);
     if (translate_result == TU_TRANSLATE_FALLBACK) {
