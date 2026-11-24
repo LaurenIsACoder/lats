@@ -133,6 +133,33 @@ void tcg_tb_remove(TranslationBlock *tb)
 }
 
 #ifdef CONFIG_LATX_TU
+static TranslationBlock *tcg_jit_repair_owner(TranslationBlock *tb,
+                                            uintptr_t pc)
+{
+    if (!tb_is_tu(tb) || (tb->bool_flags & IS_AOT_TB) ||
+        tb->s_data->next_tb[1]) {
+        return tb;
+    }
+
+    /* JIT appends every CALL repair to the last member's code range. */
+    uintptr_t offset = pc - tb_tu_identity(tb);
+    uintptr_t last_start = tb->tc.offset_in_tu;
+    uintptr_t last_end = last_start + tb->tc.size;
+
+    for (TranslationBlock *source = tb->s_data->next_tb[0]; source;
+         source = source->s_data->next_tb[0]) {
+        uint32_t start = source->s_data->ras_tp_cold_offset;
+        uint32_t size = source->s_data->ras_tp_cold_insns * 4U;
+
+        if (size && start >= last_start && start < last_end &&
+            size <= last_end - start &&
+            offset >= start && offset - start < size) {
+            return source;
+        }
+    }
+    return tb;
+}
+
 typedef struct NativeLookup {
     uintptr_t pc;
     TranslationBlock *previous;
@@ -194,7 +221,9 @@ TranslationBlock *tcg_tb_lookup(uintptr_t tc_ptr)
     qemu_mutex_lock_1(&rt->lock);
     tb = q_tree_lookup(rt->tree, &s);
 #ifdef CONFIG_LATX_TU
-    if (!tb) {
+    if (tb) {
+        tb = tcg_jit_repair_owner(tb, tc_ptr);
+    } else {
         tb = tcg_native_lookup(rt->tree, tc_ptr);
     }
 #endif
