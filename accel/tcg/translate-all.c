@@ -949,7 +949,10 @@ relock:
         if (tb_is_tu(tb) && !tu_pages_valid(cpu, tb)) {
             flags |= HF_FORCE_TB_MODE;
             env->hflags |= HF_FORCE_TB_MODE;
-            lookup_after_lock = true;
+            etb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+            if (etb) {
+                return etb;
+            }
             goto relock;
         }
 #endif

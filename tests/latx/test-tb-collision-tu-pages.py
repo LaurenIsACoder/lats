@@ -72,7 +72,7 @@ typedef struct { CPUArchState *env_ptr; int exception_index; } CPUState;
 enum { ENTRY = 0x1000, SUCCESSOR = 0x2000, ENTRY_FRAME = 0x4000,
        ORIGINAL_FRAME = 0x5000, OTHER_FRAME = 0x6000, USER_FLAGS = 3 };
 static TranslationBlock winner, forced;
-static bool page_locked, forced_cached;
+static bool page_locked, forced_cached, retry_page_busy, lookup_held_lock;
 static unsigned generations, collisions;
 #define tb_cflags(tb) ((tb)->cflags)
 #define tb_page_addr0(tb) ((tb)->entry_page)
@@ -102,7 +102,6 @@ static struct { typeof(data) *tr_data; } ls = { &data }, *lsenv = &ls;
 #define assert_memory_lock() ((void)0)
 #define qemu_thread_jit_write() ((void)0)
 #define tlb_protect_code(phys) ((void)0)
-#define tb_lock_page0(phys) abort()
 #define tb_unlock_page0(phys) tb_unlock_ctx_pages(1)
 #define assert_no_pages_locked() assert(!page_locked)
 #define qatomic_set(ptr, value) abort()
@@ -127,8 +126,17 @@ static tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr pc,
 static bool tb_trylock_page0(tb_page_addr_t phys)
 {
     assert(phys == ENTRY_FRAME && !page_locked);
+    if (retry_page_busy && collisions) {
+        return true;
+    }
     page_locked = true;
     return false;
+}
+
+static void tb_lock_page0(tb_page_addr_t phys)
+{
+    assert(phys == ENTRY_FRAME && !page_locked && retry_page_busy);
+    page_locked = true;
 }
 
 static void tb_unlock_ctx_pages(int all)
@@ -140,9 +148,14 @@ static void tb_unlock_ctx_pages(int all)
 static TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc, uint64_t cs,
                                    uint32_t flags, int cflags)
 {
-    assert(page_locked && flags == (USER_FLAGS | HF_FORCE_TB_MODE));
     assert(flags == cpu->env_ptr->hflags);
     assert(pc == ENTRY && cs == 0 && cflags == 0);
+    lookup_held_lock |= page_locked;
+    if (flags == winner.flags) {
+        /* A jump-cache hit can return the winner without checking its TU. */
+        return &winner;
+    }
+    assert(flags == forced.flags);
     return forced_cached ? &forced : NULL;
 }
 
@@ -161,8 +174,8 @@ static TranslationBlock *lat_tb_gen_code_locked(CPUState *cpu, vaddr pc,
         *error = GENCODE_ERR_TB_EXIST;
         return &winner;
     }
-    assert(tb_cmp(&key, &forced) && !forced_cached);
-    *error = GENCODE_ERR_NONE;
+    assert(tb_cmp(&key, &forced));
+    *error = forced_cached ? GENCODE_ERR_TB_EXIST : GENCODE_ERR_NONE;
     return &forced;
 }
 ''' + generator + r'''
@@ -188,14 +201,16 @@ static bool check(const char *name, bool is_tu, tb_page_addr_t successor,
     forced.is_tu = false;
     forced.pages = NULL;
     forced_cached = cached;
+    lookup_held_lock = false;
     generations = collisions = 0;
     TranslationBlock *result = lat_tb_gen_code(&cpu, ENTRY, 0, env.hflags, 0);
     bool ok = result == (retry ? &forced : &winner) &&
               env.hflags == (retry ? forced.flags : winner.flags) &&
               collisions == 1 && generations == (retry && !cached ? 2u : 1u) &&
-              !page_locked;
-    printf("%s %s (returned %s, generations %u)\n", ok ? "PASS" : "FAIL",
-           name, result == &winner ? "winner" : "forced TB", generations);
+              !lookup_held_lock && !page_locked;
+    printf("%s %s (returned %s, generations %u, lookup held lock %d)\n",
+           ok ? "PASS" : "FAIL", name, result == &winner ? "winner" : "forced TB",
+           generations, lookup_held_lock);
     return ok;
 }
 
@@ -207,6 +222,11 @@ int main(void)
     ok &= check("TU with unmapped successor", true, (tb_page_addr_t)-1, false);
     ok &= check("remapped successor with cached forced TB", true,
                 OTHER_FRAME, true);
+    retry_page_busy = true;
+    ok &= check("busy retry page with cached forced TB", true,
+                OTHER_FRAME, true);
+    ok &= check("busy retry page without cached forced TB", true,
+                OTHER_FRAME, false);
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 '''
