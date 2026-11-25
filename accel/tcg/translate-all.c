@@ -1015,8 +1015,13 @@ relock:
     case GENCODE_ERR_TB_EXIST: /* existing tb */
         tb_unlock_ctx_pages(1);
 #if defined(CONFIG_SOFTMMU) && defined(CONFIG_LATX_TU)
-        /* A competing TU can own additional pages outside this TB's key. */
-        if (tb_is_tu(tb) && !tu_pages_valid(cpu, tb)) {
+        if (tb_is_tu(tb)) {
+            /* The registration key covers this member. Check its whole TU. */
+            if (tu_pages_valid(cpu, tb)) {
+                return tb;
+            }
+
+            /* Reuse a cached single TB before taking the page lock again. */
             flags |= HF_FORCE_TB_MODE;
             env->hflags |= HF_FORCE_TB_MODE;
             etb = tb_lookup(cpu, pc, cs_base, flags, cflags);
